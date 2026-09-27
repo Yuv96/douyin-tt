@@ -25,7 +25,8 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install fixture dependencies
-        run: python -m pip install --only-binary=:all: --no-compile -r companion/requirements-sync.txt
+        run: |
+          python -m pip install --only-binary=:all: --no-compile -r companion/requirements-sync.txt
       - name: Prepare the portable runtime without source builds
         run: python -B -c "from pathlib import Path; from threading import Event; import run_douyin_tt as app; app.prepare(Path.cwd(), Event()); assert app.ready(Path.cwd())"
       - name: Check native Tk lifecycle
