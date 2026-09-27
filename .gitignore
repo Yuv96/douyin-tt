@@ -10,3 +10,4 @@ __pycache__/
 .DS_Store
 .runtime/
 /*.app/
+companion/wheels/

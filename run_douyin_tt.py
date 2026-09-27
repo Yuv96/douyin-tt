@@ -97,6 +97,7 @@ def prepare(root, cancel, run=quiet_run):
         run([base, "-B", "-m", "venv", str(env)], cancel)
     run([str(interpreter(root)), "-B", "-m", "pip", "install",
          "--only-binary=:all:", "--no-compile", "--disable-pip-version-check",
+         "--find-links", str(root / "companion" / "wheels"),
          "-r", str(root / "companion" / "requirements-sync.txt")], cancel)
     if cancel.is_set():
         raise Cancelled()

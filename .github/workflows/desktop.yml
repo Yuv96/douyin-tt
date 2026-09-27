@@ -12,7 +12,23 @@ permissions:
   contents: read
 
 jobs:
+  prepare-wheels:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # This pure-Python dependency has no upstream wheel. Build it only on GitHub.
+      - run: python -m pip wheel --no-deps proxy_tools==0.1.0 --wheel-dir wheels
+      - uses: actions/upload-artifact@v4
+        with:
+          name: companion-dependency-wheel
+          path: wheels/*.whl
+          retention-days: 1
+
   desktop-tests:
+    needs: prepare-wheels
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -24,9 +40,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: companion-dependency-wheel
+          path: companion/wheels
       - name: Install fixture dependencies
         run: |
-          python -m pip install --only-binary=:all: --no-compile -r companion/requirements-sync.txt
+          python -m pip install --only-binary=:all: --no-compile --find-links companion/wheels -r companion/requirements-sync.txt
       - name: Prepare the portable runtime without source builds
         run: python -B -c "from pathlib import Path; from threading import Event; import run_douyin_tt as app; app.prepare(Path.cwd(), Event()); assert app.ready(Path.cwd())"
       - name: Check native Tk lifecycle
@@ -76,12 +96,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: companion-dependency-wheel
+          path: companion/wheels
       - name: Compile AppleScript and package tracked sources
         shell: bash
         run: |
           bundle="$RUNNER_TEMP/douyin-tt"
           mkdir -p "$bundle"
           git archive --format=tar HEAD | tar -x -C "$bundle"
+          mkdir -p "$bundle/companion/wheels"
+          cp companion/wheels/*.whl "$bundle/companion/wheels/"
           test -f "$bundle/run_douyin_tt.py"
           test -f "$bundle/start_douyin_tt.bat"
           test ! -e "$bundle/.runtime"
