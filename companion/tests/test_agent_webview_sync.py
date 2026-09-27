@@ -502,7 +502,7 @@ class PersistentBrowserTests(Fixtures):
         for path in self.directory.glob("*.json"):
             if not sync.WINDOWS:
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-            self.assertNotIn("synthetic-account", path.read_text())
+            self.assertNotIn("synthetic-account", path.read_text(encoding="utf-8"))
 
     def test_lost_login_preserves_receiver_and_shows_existing_window_with_backoff(self):
         self.service.heartbeat()
