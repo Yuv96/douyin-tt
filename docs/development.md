@@ -6,6 +6,7 @@
 
 - [Android checks](../.github/workflows/android.yml)：默认运行源码与合成检查；显式启用 `build_apk` 才编译、运行 API 21 回归并上传 Actions 产物。
 - [Companion checks](../.github/workflows/companion.yml)：检查电脑工具与协议合成用例。
+- [Desktop checks and launchers](../.github/workflows/desktop.yml)：在 macOS、Windows 检查桌面启动与退出；显式启用 `package_launchers` 才生成 AppleScript `.app` 与源码包。
 
 构建依赖固定 SHA-256 的基础 APK，不是完整 Gradle 工程。依赖与版本见 [build.py](../android/build.py)，签名要求见 [signing.py](../android/signing.py)。不提供 Release 安装包。
 

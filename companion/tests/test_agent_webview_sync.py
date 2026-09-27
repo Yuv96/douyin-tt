@@ -1,5 +1,6 @@
 """Synthetic HTTP fixtures only; execute in GitHub Actions, never against an account."""
 import base64
+import errno
 from contextlib import ExitStack, redirect_stdout, redirect_stderr
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
@@ -13,6 +14,7 @@ import stat
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch, Mock
 
@@ -305,6 +307,31 @@ class PairingTests(Fixtures):
         self.assertEqual(result["pairing_key"], KEY.hex())
         self.assertEqual([r[1] for r in server.requests].count("/v1/pair/status"), 2)
 
+    def test_cancel_before_begin_or_at_comparison_never_accepts_a_key(self):
+        stop = threading.Event()
+        stop.set()
+        with patch.object(sync, "wire_json") as wire, self.assertRaises(sync.SyncError) as failure:
+            sync.PairingClient("10.0.0.2").pair(stop_event=stop)
+        self.assertEqual(failure.exception.code, "cancelled")
+        wire.assert_not_called()
+        stop.clear()
+        server = self.fixture(PairingFixture())
+        with self.assertRaises(sync.SyncError) as failure:
+            server.client().pair(lambda *_: stop.set(), stop_event=stop)
+        self.assertEqual(failure.exception.code, "cancelled")
+        self.assertEqual([request[1] for request in server.requests], ["/v1/pair/begin", "/v1/pair/reveal"])
+
+    def test_cancel_interrupts_the_pending_pair_wait(self):
+        stop = threading.Event()
+        server = self.fixture(PairingFixture())
+        def cancel_wait(_):
+            stop.set()
+            return True
+        with patch.object(stop, "wait", side_effect=cancel_wait), self.assertRaises(sync.SyncError) as failure:
+            server.client().pair(lambda *_: None, stop_event=stop)
+        self.assertEqual(failure.exception.code, "cancelled")
+        self.assertEqual([request[1] for request in server.requests].count("/v1/pair/status"), 1)
+
     def test_plain_approved_tampering_and_identity_substitution_never_release_key(self):
         for mode in ("plain_approved", "tampered", "wrong_receiver", "wrong_pair", "wrong_transcript"):
             with self.subTest(mode=mode):
@@ -473,7 +500,8 @@ class PersistentBrowserTests(Fixtures):
                              for method, path in self.browser.calls))
         self.assertGreaterEqual(self.browser.hidden, 2)
         for path in self.directory.glob("*.json"):
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            if not sync.WINDOWS:
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             self.assertNotIn("synthetic-account", path.read_text())
 
     def test_lost_login_preserves_receiver_and_shows_existing_window_with_backoff(self):
@@ -527,18 +555,64 @@ class PersistentBrowserTests(Fixtures):
 
 
 class LocalStateTests(Fixtures):
+    def pretend_background(self, directory, fd):
+        sync.release_lock(fd)
+
     def test_stop_during_heartbeat_does_not_begin_another_push(self):
         service = Mock(page_verified=True)
+        worker, thread = Mock(), Mock()
+        worker.stop = threading.Event()
 
         def heartbeat():
             sync.private_write(self.directory / "stop.json", {"requested": True})
             return {"retry_seconds": 120}
 
         service.heartbeat.side_effect = heartbeat
-        with patch.object(sync, "make_service", return_value=service):
+        with patch.object(sync, "make_service", return_value=service), \
+                patch("browser_actions.start_worker", return_value=(worker, thread)):
             sync.run_service(self.directory)
         service.synchronize.assert_not_called()
         service.report.assert_called_once_with("stopped", browser_retained=True)
+        self.assertTrue(worker.stop.is_set())
+        thread.join.assert_called_once_with()
+
+    def test_gui_event_stops_service_and_action_worker_before_another_push(self):
+        stop = threading.Event()
+        service = Mock(page_verified=True)
+        worker, thread = Mock(stop=stop), Mock()
+        def heartbeat():
+            stop.set()
+            return {"retry_seconds": 120}
+        service.heartbeat.side_effect = heartbeat
+        with patch.object(sync, "make_service", return_value=service), \
+                patch("browser_actions.start_worker", return_value=(worker, thread)) as start:
+            sync.run_service(self.directory, stop)
+        start.assert_called_once_with(service.web, self.directory, stop=stop)
+        service.synchronize.assert_not_called()
+        service.report.assert_called_once_with("stopped", browser_retained=True)
+        thread.join.assert_called_once_with()
+        with patch.object(sync, "make_service") as make:
+            sync.run_service(self.directory, stop)
+        make.assert_not_called()
+
+    def test_gui_pair_callback_is_forwarded_and_cancelled_config_is_not_saved(self):
+        original = {"ip": "10.0.0.2", "interval": 600, "pairing_key": KEY.hex(), "receiver_id": RECEIVER}
+        path = self.directory / "config.json"
+        sync.private_write(path, original)
+        before = path.read_bytes()
+        stop, compared = threading.Event(), Mock()
+        args = SimpleNamespace(ip=None, interval=None, keep_visible=True, read_only=False, pair=True)
+        def pair(on_compare, stop_event):
+            on_compare("123456", "c" * 32)
+            stop_event.set()
+            return {"pairing_key": "d" * 32, "receiver_id": "e" * 32}
+        with patch.object(sync.PairingClient, "pair", side_effect=pair) as pairing, \
+                self.assertRaises(sync.SyncError) as failure:
+            sync.load_config(self.directory, args, on_compare=compared, stop_event=stop)
+        self.assertEqual(failure.exception.code, "cancelled")
+        pairing.assert_called_once_with(on_compare=compared, stop_event=stop)
+        compared.assert_called_once_with("123456", "c" * 32)
+        self.assertEqual(path.read_bytes(), before)
 
     def test_lock_is_single_instance_and_config_is_private(self):
         fd = sync.claim_lock(self.directory)
@@ -547,17 +621,110 @@ class LocalStateTests(Fixtures):
                 sync.claim_lock(self.directory)
             self.assertEqual(error.exception.code, "already_running")
         finally:
-            os.close(fd)
+            sync.release_lock(fd)
         self.assertFalse(sync.running(self.directory))
-        self.assertEqual(stat.S_IMODE(self.directory.stat().st_mode), 0o700)
+        if not sync.WINDOWS:
+            self.assertEqual(stat.S_IMODE(self.directory.stat().st_mode), 0o700)
+
+    def test_named_gui_bootstrap_and_start_locks_remain_independent(self):
+        held = []
+        try:
+            for name in ("sync.lock", "desktop.lock", "bootstrap.lock", "start.lock"):
+                held.append(sync.claim_lock(self.directory, name))
+                with self.assertRaises(sync.SyncError) as failure:
+                    sync.claim_lock(self.directory, name)
+                self.assertEqual(failure.exception.code, "already_running")
+            with self.assertRaises(sync.SyncError):
+                sync.claim_lock(self.directory, "../outside.lock")
+        finally:
+            for fd in held:
+                sync.release_lock(fd)
+
+    def test_windows_lock_uses_one_byte_without_posix_only_calls(self):
+        windows = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=0, locking=Mock())
+        with patch.object(sync, "WINDOWS", True), patch.object(sync, "msvcrt", windows), \
+                patch.object(sync.os, "fchmod", side_effect=AssertionError("POSIX-only"), create=True), \
+                patch.object(sync.os, "getuid", side_effect=AssertionError("POSIX-only"), create=True):
+            fd = sync.claim_lock(self.directory)
+            self.assertEqual(os.fstat(fd).st_size, 1)
+            windows.locking.assert_called_once_with(fd, windows.LK_NBLCK, 1)
+            sync.release_lock(fd)
+            windows.locking.assert_called_with(fd, windows.LK_UNLCK, 1)
+            sync.private_write(self.directory / "state.json", {"fixture": True})
+            self.assertEqual(sync.private_json(self.directory / "state.json"), {"fixture": True})
+        with self.assertRaises(OSError):
+            os.fstat(fd)
+
+    @unittest.skipIf(sync.WINDOWS, "Unix owner/mode and symlink security")
+    def test_posix_private_mode_and_symlink_refusal_are_preserved(self):
+        path = self.directory / "state.json"
+        path.write_text('{}')
+        path.chmod(0o644)
+        with self.assertRaises(sync.SyncError):
+            sync.private_json(path)
+        path.chmod(0o600)
+        (self.directory / "sync.lock").symlink_to(path)
+        with self.assertRaises(sync.SyncError):
+            sync.claim_lock(self.directory)
+
+    def test_windows_background_handoff_never_passes_file_descriptors(self):
+        child = Mock(pid=4321)
+        def spawn(command, **kwargs):
+            nonce = command[command.index("--startup") + 1]
+            sync.private_write(sync.startup_path(self.directory, nonce), {"state": "locked", "pid": child.pid})
+            return child
+        with patch.object(sync, "WINDOWS", True), patch.object(sync, "release_lock") as release, \
+                patch.object(sync.subprocess, "Popen", side_effect=spawn) as process:
+            sync.start_background(self.directory, 42)
+        release.assert_called_once_with(42)
+        self.assertNotIn("pass_fds", process.call_args.kwargs)
+        self.assertNotIn("start_new_session", process.call_args.kwargs)
+        self.assertIn("creationflags", process.call_args.kwargs)
+        receipt = next(self.directory.glob('.startup-*.json'))
+        self.assertEqual(sync.private_json(receipt), {"state": "accepted", "pid": child.pid})
+
+    def test_child_waits_for_parent_acceptance_while_owning_service_lock(self):
+        nonce = "b" * 32
+        path = sync.startup_path(self.directory, nonce)
+        sync.private_write(path, {"state": "pending"})
+        write = sync.private_write
+        def parent_accepts(target, value):
+            if value.get("state") == "locked":
+                with self.assertRaises(sync.SyncError) as failure:
+                    sync.claim_lock(self.directory)
+                self.assertEqual(failure.exception.code, "already_running")
+                value = {"state": "accepted", "pid": value["pid"]}
+            write(target, value)
+        with patch.object(sync, "private_write", side_effect=parent_accepts):
+            fd = sync.claim_startup(self.directory, nonce)
+        try:
+            self.assertTrue(sync.running(self.directory))
+            self.assertFalse(path.exists())
+        finally:
+            sync.release_lock(fd)
+
+    def test_failed_child_start_releases_lock_and_removes_handshake(self):
+        with patch.object(sync, "WINDOWS", True), patch.object(sync, "release_lock") as release, \
+                patch.object(sync.subprocess, "Popen", return_value=Mock(pid=4321, poll=Mock(return_value=1))), \
+                self.assertRaises(sync.SyncError) as failure:
+            sync.start_background(self.directory, 42)
+        self.assertEqual(failure.exception.code, "startup_failed")
+        release.assert_called_once_with(42)
+        self.assertEqual(list(self.directory.glob('.startup-*.json')), [])
+
+    def test_native_browser_process_options_hide_windows_console(self):
+        with patch.object(sync, "WINDOWS", True):
+            self.assertEqual(set(sync.background_process_options()), {"creationflags"})
+        with patch.object(sync, "WINDOWS", False):
+            self.assertEqual(sync.background_process_options(), {"start_new_session": True})
 
     def test_pairing_key_is_private_and_never_in_process_arguments_or_output(self):
         output = io.StringIO()
         with patch.object(sync.PairingClient, "pair", return_value={"pairing_key": KEY.hex(),
                 "receiver_id": RECEIVER}) as pair, \
-                patch.object(sync.subprocess, "Popen") as process, redirect_stdout(output):
+                patch.object(sync, "start_background", side_effect=self.pretend_background) as process, redirect_stdout(output):
             sync.main(["--directory", str(self.directory), "start", "--ip", "10.0.0.2"])
-        pair.assert_called_once_with()
+        pair.assert_called_once_with(on_compare=None, stop_event=None)
         self.assertNotIn(KEY.hex(), output.getvalue())
 
         self.assertNotIn(KEY.hex(), str(process.call_args))
@@ -565,7 +732,8 @@ class LocalStateTests(Fixtures):
         self.assertEqual(config["ip"], "10.0.0.2")
         self.assertEqual(config["pairing_key"], KEY.hex())
         self.assertEqual(config["receiver_id"], RECEIVER)
-        self.assertEqual(stat.S_IMODE((self.directory / "config.json").stat().st_mode), 0o600)
+        if not sync.WINDOWS:
+            self.assertEqual(stat.S_IMODE((self.directory / "config.json").stat().st_mode), 0o600)
         self.assertEqual(config["interval"], 600)
         output = io.StringIO()
         with redirect_stdout(output):
@@ -591,7 +759,7 @@ class LocalStateTests(Fixtures):
         sync.private_write(self.directory / "config.json", {"ip": "127.0.0.1", "interval": 600,
             "pairing_key": KEY.hex(), "receiver_id": RECEIVER, "generation": 7})
         with patch.object(sync, "PairingClient") as client, \
-                patch.object(sync.subprocess, "Popen"), redirect_stdout(io.StringIO()):
+                patch.object(sync, "start_background", side_effect=self.pretend_background), redirect_stdout(io.StringIO()):
             client.return_value.pair.return_value = {"pairing_key": "f" * 32, "receiver_id": "c" * 32}
             sync.main(["--directory", str(self.directory), "start", "--ip", "127.0.0.2"])
         client.assert_called_once_with("127.0.0.2")
@@ -602,7 +770,7 @@ class LocalStateTests(Fixtures):
 
     def test_read_only_start_does_not_ask_for_secret_and_stop_never_kills_browser(self):
         with patch.object(sync.PairingClient, "pair") as prompt, \
-                patch.object(sync.subprocess, "Popen"), redirect_stdout(io.StringIO()):
+                patch.object(sync, "start_background", side_effect=self.pretend_background), redirect_stdout(io.StringIO()):
             sync.main(["--directory", str(self.directory), "start", "--read-only"])
         prompt.assert_not_called()
         config = sync.private_json(self.directory / "config.json")
@@ -626,13 +794,13 @@ class LocalStateTests(Fixtures):
                 sync.main(["--directory", str(self.directory), "stop"])
             self.assertTrue((self.directory / "stop.json").exists())
         finally:
-            os.close(fd)
+            sync.release_lock(fd)
 
     def test_first_sync_requires_explicit_target_before_pairing_or_browser_work(self):
         for command in ("start", "once"):
             with self.subTest(command=command), patch.object(sync, "PairingClient") as pair, \
                     patch.object(sync, "ensure_browser") as browser, \
-                    patch.object(sync.subprocess, "Popen") as process, \
+                    patch.object(sync, "start_background") as process, \
                     redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
                 with self.assertRaises(SystemExit) as stopped:
                     sync.main(["--directory", str(self.directory), command])
@@ -647,7 +815,7 @@ class LocalStateTests(Fixtures):
         path = self.directory / "config.json"
         sync.private_write(path, {"interval": 600, "keep_visible": False, "read_only": True})
         before = path.read_bytes()
-        with patch.object(sync, "PairingClient") as pair, patch.object(sync.subprocess, "Popen") as process, \
+        with patch.object(sync, "PairingClient") as pair, patch.object(sync, "start_background") as process, \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             sync.main(["--directory", str(self.directory), "start"])
         self.assertEqual(path.read_bytes(), before)
@@ -658,7 +826,8 @@ class LocalStateTests(Fixtures):
         config = {"ip": "10.0.0.2", "interval": 600, "pairing_key": KEY.hex(),
                   "receiver_id": RECEIVER, "generation": 7}
         sync.private_write(self.directory / "config.json", config)
-        with patch.object(sync, "PairingClient") as pair, patch.object(sync.subprocess, "Popen") as process, \
+        with patch.object(sync, "PairingClient") as pair, \
+                patch.object(sync, "start_background", side_effect=self.pretend_background) as process, \
                 redirect_stdout(io.StringIO()):
             sync.main(["--directory", str(self.directory), "start"])
         pair.assert_not_called()

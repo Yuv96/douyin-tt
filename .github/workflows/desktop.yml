@@ -1,0 +1,114 @@
+name: 抖音TT · Desktop checks and launchers
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_launchers:
+        description: Compile the Mac launcher and package a source bundle without publishing
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  desktop-tests:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install fixture dependencies
+        run: python -m pip install --only-binary=:all: --no-compile -r companion/requirements-sync.txt
+      - name: Prepare the portable runtime without source builds
+        run: python -B -c "from pathlib import Path; from threading import Event; import run_douyin_tt as app; app.prepare(Path.cwd(), Event()); assert app.ready(Path.cwd())"
+      - name: Check native Tk lifecycle
+        run: python -B -c "import tkinter as tk; app = tk.Tk(); app.withdraw(); app.update_idletasks(); app.destroy()"
+      - name: Require desktop fixtures
+        run: python -B -c "from pathlib import Path; assert list(Path('companion/tests').glob('test_desktop*.py')), 'Desktop fixtures are required'"
+      - name: Run desktop GUI fixtures
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python -B -m unittest discover -s companion/tests -p 'test_desktop*.py' -v
+      - name: Run browser lifecycle fixtures
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python -B -m unittest discover -s companion/tests -p 'test_agent_webview_sync.py' -v
+      - name: Verify Windows launcher with a synthetic entry point
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $fixture = Join-Path $env:RUNNER_TEMP 'douyin tt launcher fixture'
+          New-Item -ItemType Directory -Force -Path $fixture | Out-Null
+          Copy-Item start_douyin_tt.bat (Join-Path $fixture 'start_douyin_tt.bat')
+          python -B -m venv (Join-Path $fixture '.runtime/venv')
+          if ($LASTEXITCODE -ne 0) { throw 'Fixture environment setup failed' }
+          @'
+          from pathlib import Path
+          import sys
+          root = Path(__file__).resolve().parent
+          result = 'venv' if Path(sys.prefix).resolve() == root / '.runtime' / 'venv' else 'system'
+          (root / 'started.txt').write_text(result, encoding='utf-8')
+          '@ | Set-Content -Encoding utf8 (Join-Path $fixture 'run_douyin_tt.py')
+          $command = '""' + (Join-Path $fixture 'start_douyin_tt.bat') + '""'
+          $process = Start-Process -FilePath $env:ComSpec -ArgumentList @('/d', '/c', $command) -WindowStyle Hidden -PassThru
+          if (-not $process.WaitForExit(30000)) { $process.Kill($true); throw 'Windows launcher timed out' }
+          if ($process.ExitCode -ne 0) { throw 'Windows launcher rejected the fixture' }
+          $marker = Join-Path $fixture 'started.txt'
+          for ($attempt = 0; $attempt -lt 50 -and -not (Test-Path $marker); $attempt++) { Start-Sleep -Milliseconds 200 }
+          if (-not (Test-Path $marker)) { throw 'Windows launcher did not start the fixture' }
+          if ((Get-Content $marker -Raw) -ne 'venv') { throw 'Windows launcher did not use the project environment' }
+
+  package-launchers:
+    if: inputs.package_launchers == true
+    needs: desktop-tests
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile AppleScript and package tracked sources
+        shell: bash
+        run: |
+          bundle="$RUNNER_TEMP/douyin-tt"
+          mkdir -p "$bundle"
+          git archive --format=tar HEAD | tar -x -C "$bundle"
+          test -f "$bundle/run_douyin_tt.py"
+          test -f "$bundle/start_douyin_tt.bat"
+          test ! -e "$bundle/.runtime"
+          test ! -e "$bundle/.local-debug"
+          test ! -e "$bundle/.git"
+          /usr/bin/osacompile -o "$bundle/抖音TT.app" "$bundle/start_douyin_tt.applescript"
+          /usr/bin/plutil -lint "$bundle/抖音TT.app/Contents/Info.plist"
+          fixture="$RUNNER_TEMP/douyin tt launcher fixture"
+          mkdir -p "$fixture"
+          /usr/bin/ditto "$bundle/抖音TT.app" "$fixture/抖音TT.app"
+          python -B -m venv "$fixture/.runtime/venv"
+          cat > "$fixture/run_douyin_tt.py" <<'PY'
+          from pathlib import Path
+          import sys
+          root = Path(__file__).resolve().parent
+          result = 'venv' if Path(sys.prefix).resolve() == root / '.runtime' / 'venv' else 'system'
+          (root / 'started.txt').write_text(result, encoding='utf-8')
+          PY
+          python -B -c 'import subprocess, sys; subprocess.run(["/usr/bin/open", "-W", sys.argv[1]], check=True, timeout=30)' "$fixture/抖音TT.app"
+          for attempt in $(seq 1 50); do
+            if [ -f "$fixture/started.txt" ]; then break; fi
+            sleep 0.2
+          done
+          test "$(cat "$fixture/started.txt")" = venv
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$bundle" "$RUNNER_TEMP/douyin-tt-launchers.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: douyin-tt-launchers
+          path: ${{ runner.temp }}/douyin-tt-launchers.zip
+          if-no-files-found: error
+          retention-days: 14

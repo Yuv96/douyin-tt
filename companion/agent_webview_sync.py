@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
-import fcntl
+import errno
 import hashlib
 import hmac
 import ipaddress
@@ -17,8 +17,10 @@ import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
@@ -28,6 +30,14 @@ from browser_session import (DebugError, NoRedirect, ControllerClient, applicabl
                          cookie_header, direct_read, official_page, private_write,
                          profile_identity, read_json, SELF, COMMON)
 from urllib.parse import urlencode
+
+WINDOWS = os.name == "nt"
+if WINDOWS:
+    import msvcrt
+    fcntl = None
+else:
+    import fcntl
+    msvcrt = None
 
 ROOT = Path(__file__).resolve().parents[1]
 PRIVATE = ROOT / ".local-debug" / "sync"
@@ -71,28 +81,76 @@ class SyncError(DebugError):
 def private_directory(directory):
     directory = Path(directory)
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if directory.is_symlink():
+    if linked_path(directory):
         raise SyncError("private_path", "私有目录不能是符号链接。")
     os.chmod(directory, 0o700)
     return directory
 
 
+def linked_path(path):
+    """Windows junctions/reparse points are not equivalent to private regular files."""
+    path = Path(path)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0)
+                                            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
 def private_json(path):
-    if path.is_symlink() or (path.stat().st_mode & 0o077) or path.stat().st_uid != os.getuid():
+    path = Path(path)
+    info = path.stat()
+    # POSIX owner/mode bits are meaningful on Unix. Windows access is controlled by
+    # the user's directory ACL; chmod does not implement Unix permission bits there.
+    if linked_path(path) or (not WINDOWS and ((info.st_mode & 0o077) or info.st_uid != os.getuid())):
         raise SyncError("private_permissions", "运行文件必须由当前用户拥有且权限为 600。")
     return read_json(path)
 
 
-def claim_lock(directory):
-    private_directory(directory)
-    fd = os.open(directory / "sync.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    os.fchmod(fd, 0o600)
+def claim_lock(directory, name="sync.lock"):
+    directory = private_directory(directory)
+    if name not in {"sync.lock", "desktop.lock", "bootstrap.lock", "start.lock"}:
+        raise SyncError("private_path")
+    path = directory / name
+    if linked_path(path):
+        raise SyncError("private_path", "锁文件不能是符号链接。")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+        opened, current = os.fstat(fd), path.stat()
+        if linked_path(path) or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise SyncError("private_path")
+        if WINDOWS:
+            if opened.st_size == 0:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            os.fchmod(fd, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
         os.close(fd)
-        raise SyncError("already_running", "同步任务已运行；使用 status 查看或 stop 暂停。") from None
+        if error.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+            raise SyncError("already_running", "同步任务已运行；使用 status 查看或 stop 暂停。") from None
+        raise
+    except Exception:
+        os.close(fd)
+        raise
     return fd
+
+
+def release_lock(fd):
+    try:
+        if WINDOWS:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    finally:
+        os.close(fd)
+
+
+def raise_if_cancelled(stop_event):
+    if stop_event is not None and stop_event.is_set():
+        raise SyncError("cancelled", "已取消；原配置和浏览器会话已保留。")
 
 
 def encode64(value):
@@ -161,7 +219,8 @@ class PairingClient:
             raise SyncError("invalid_config")
         self.base = "http://" + private_host(host) + ":" + str(port)
 
-    def pair(self, on_compare=None):
+    def pair(self, on_compare=None, stop_event=None):
+        raise_if_cancelled(stop_event)
         try:
             from cryptography.exceptions import InvalidTag, UnsupportedAlgorithm
             from cryptography.hazmat.primitives import hashes, serialization
@@ -174,13 +233,15 @@ class PairingClient:
         deadline = time.monotonic() + 120
 
         def exchange(operation, body):
+            raise_if_cancelled(stop_event)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise SyncError("pair_expired", "配对已过期；请在电视电脑同步页面重新发起。")
             try:
                 result = wire_json(self.base + "/v1/pair/" + operation, body,
-                                   timeout=min(10, remaining))
+                                   timeout=min(3 if stop_event is not None else 10, remaining))
             except SyncError as error:
+                raise_if_cancelled(stop_event)
                 if operation == "begin":
                     messages = {
                         "http_404": ("pair_upgrade", "电视暂不支持免输入配对，请升级电视应用后重试。"),
@@ -191,6 +252,7 @@ class PairingClient:
                     if error.code in messages:
                         raise SyncError(*messages[error.code]) from None
                 raise
+            raise_if_cancelled(stop_event)
             if time.monotonic() >= deadline:
                 raise SyncError("pair_expired", "配对已过期；请重新发起。")
             if type(result.get("version")) is not int or result["version"] != 1:
@@ -238,6 +300,7 @@ class PairingClient:
                   flush=True)
         else:
             on_compare(sas, pair_id)
+        raise_if_cancelled(stop_event)
         while True:
             result = exchange("status", {"version": 1, "pair_id": pair_id})
             if result.get("pair_id") != pair_id:
@@ -250,7 +313,12 @@ class PairingClient:
                     raise SyncError("invalid_pair_response")
                 if status != "pending":
                     raise SyncError("pair_" + status, "配对未获允许或已过期；原配置和浏览器会话已保留。")
-                time.sleep(min(1, max(0, deadline - time.monotonic())))
+                delay = min(1, max(0, deadline - time.monotonic()))
+                if stop_event is None:
+                    time.sleep(delay)
+                else:
+                    stop_event.wait(delay)
+                raise_if_cancelled(stop_event)
                 continue
             if status != "approved" or set(result) != {"version", "pair_id", "status", "nonce", "payload"}:
                 raise SyncError("unauthenticated_pair_response")
@@ -265,6 +333,7 @@ class PairingClient:
                     or not isinstance(approved["pairing_key"], str)
                     or not re.fullmatch(r"[a-f0-9]{32}", approved["pairing_key"])):
                 raise SyncError("unauthenticated_pair_response")
+            raise_if_cancelled(stop_event)
             return {"receiver_id": receiver, "pairing_key": approved["pairing_key"]}
 
 
@@ -379,6 +448,10 @@ def clean_environment():
     return result
 
 
+def background_process_options():
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if WINDOWS else {"start_new_session": True}
+
+
 def ensure_browser(directory, port=CONTROLLER_PORT, *, launch=True):
     directory = private_directory(directory)
     runtime = directory / "controller.json"
@@ -397,7 +470,8 @@ def ensure_browser(directory, port=CONTROLLER_PORT, *, launch=True):
         child = subprocess.Popen([sys.executable, "-B", "-m", "agent_webview", "--host", "127.0.0.1",
             "--port", str(port), "--runtime-file", str(runtime), "--runtime-dir", str(directory / "workers"),
             "--data-dir", str(directory / "browser-data"), "--log-level", "CRITICAL"],
-            env=clean_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            env=clean_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            **background_process_options())
         for _ in range(100):
             if child.poll() is not None:
                 raise SyncError("controller_start", "专属控制器启动失败；检查 agent-webview 安装与 8767 端口。")
@@ -556,7 +630,8 @@ class SyncService:
             return self.report("sync_unavailable", retry_seconds=self.push_retry.failed())
 
 
-def load_config(directory, args=None):
+def load_config(directory, args=None, *, on_compare=None, stop_event=None):
+    raise_if_cancelled(stop_event)
     path = directory / "config.json"
     config = private_json(path) if path.exists() else {"interval": 600, "keep_visible": False}
     target_changed = False
@@ -583,9 +658,10 @@ def load_config(directory, args=None):
         raise SyncError("invalid_pairing")
     if args is not None:
         if not args.read_only and (args.pair or target_changed or "pairing_key" not in config):
-            paired = PairingClient(config["ip"]).pair()
+            paired = PairingClient(config["ip"]).pair(on_compare=on_compare, stop_event=stop_event)
             config.update(paired)
             config.pop("generation", None)
+        raise_if_cancelled(stop_event)
         private_write(path, config)
     return config
 
@@ -599,28 +675,35 @@ def make_service(directory, *, launch=True):
     return SyncService(ensure_browser(directory, launch=launch), directory, config, receiver)
 
 
-def run_service(directory):
+def run_service(directory, stop_event=None):
+    """Run under the caller's sync lock; stopping preserves the native browser session."""
+    directory = Path(directory)
+    stop_event = stop_event if stop_event is not None else threading.Event()
+    def stopping():
+        return stop_event.is_set() or (directory / "stop.json").exists()
     service = None
     action_worker = action_thread = None
     failed = False
     try:
+        if stopping():
+            return
         service = make_service(directory)
         # Independent polling must not delay the 120-second health/600-second sync loop.
         # Imports lazily to preserve login/read-only setup without crypto dependencies.
         from browser_actions import start_worker
-        action_worker, action_thread = start_worker(service.web, directory)
+        action_worker, action_thread = start_worker(service.web, directory, stop=stop_event)
         next_health = next_push = 0.0
-        while not (directory / "stop.json").exists():
+        while not stopping():
             now = time.monotonic()
             if now >= next_health:
                 result = service.heartbeat()
                 next_health = time.monotonic() + result["retry_seconds"]
-            if (directory / "stop.json").exists():
+            if stopping():
                 break
             if service.page_verified and now >= next_push:
                 result = service.synchronize()
                 next_push = time.monotonic() + result["retry_seconds"]
-            time.sleep(0.5)
+            stop_event.wait(0.5)
     except KeyboardInterrupt:
         pass
     except (DebugError, OSError, ValueError, TypeError, KeyError):
@@ -632,7 +715,7 @@ def run_service(directory):
         if action_worker is not None:
             action_worker.stop.set()
             # Let an already claimed bounded action publish its result; never kill/retry it.
-            action_thread.join(timeout=32)
+            action_thread.join()
         if service is not None and not failed:
             service.report("stopped", browser_retained=True)
         (directory / "stop.json").unlink(missing_ok=True)
@@ -645,8 +728,91 @@ def running(directory):
         if error.code == "already_running":
             return True
         raise
-    os.close(fd)
+    release_lock(fd)
     return False
+
+
+def startup_path(directory, nonce):
+    if not isinstance(nonce, str) or not re.fullmatch(r"[a-f0-9]{32}", nonce):
+        raise SyncError("startup_failed", "后台启动未完成，请重试。")
+    return Path(directory) / (".startup-" + nonce + ".json")
+
+
+def claim_startup(directory, nonce):
+    """Child owns the service lock before acknowledging; it waits for parent acceptance."""
+    path = startup_path(directory, nonce)
+    fd = None
+    deadline = time.monotonic() + 8
+    try:
+        while time.monotonic() < deadline:
+            if private_json(path) != {"state": "pending"}:
+                raise SyncError("startup_failed")
+            try:
+                fd = claim_lock(directory)
+                break
+            except SyncError as error:
+                if error.code != "already_running":
+                    raise
+                time.sleep(0.05)
+        if fd is None:
+            raise SyncError("already_running")
+        private_write(path, {"state": "locked", "pid": os.getpid()})
+        while time.monotonic() < deadline:
+            if private_json(path) == {"state": "accepted", "pid": os.getpid()}:
+                path.unlink()
+                return fd
+            time.sleep(0.05)
+        raise SyncError("startup_failed")
+    except Exception as error:
+        if fd is not None:
+            release_lock(fd)
+        if path.exists():
+            private_write(path, {"state": "error", "pid": os.getpid(),
+                                "code": "already_running" if isinstance(error, SyncError)
+                                and error.code == "already_running" else "startup_failed"})
+        raise
+
+
+def start_background(directory, fd):
+    """Consume the caller's service lock, either by inheritance or a Windows handoff."""
+    command = [sys.executable, "-B", str(Path(__file__).resolve()), "--directory", str(directory), "_run"]
+    if not WINDOWS:
+        try:
+            subprocess.Popen(command + ["--lock-fd", str(fd)], pass_fds=(fd,), env=clean_environment(),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        finally:
+            release_lock(fd)
+        return
+    path = startup_path(directory, secrets.token_hex(16))
+    accepted = False
+    try:
+        try:
+            private_write(path, {"state": "pending"})
+            child = subprocess.Popen(command + ["--startup", path.stem.removeprefix(".startup-")],
+                env=clean_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                              | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        finally:
+            release_lock(fd)
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            receipt = private_json(path)
+            if receipt.get("pid") == child.pid:
+                if receipt.get("state") == "locked":
+                    private_write(path, {"state": "accepted", "pid": child.pid})
+                    accepted = True
+                    return
+                if receipt.get("state") == "error":
+                    if receipt.get("code") == "already_running":
+                        raise SyncError("already_running", "同步任务已运行。")
+                    raise SyncError("startup_failed", "后台启动未完成，请重试。")
+            if child.poll() is not None:
+                break
+            time.sleep(0.05)
+        raise SyncError("startup_failed", "后台启动未完成，请重试。")
+    finally:
+        if not accepted:
+            path.unlink(missing_ok=True)
 
 
 def main(argv=None):
@@ -664,15 +830,22 @@ def main(argv=None):
         command.add_argument("--read-only", action="store_true", help="只保活，无需电视 IP，不配对、不推送")
         command.add_argument("--keep-visible", action="store_true", help="保留可见窗口，避免隐藏节流")
     internal = commands.add_parser("_run", help=argparse.SUPPRESS)
-    internal.add_argument("--lock-fd", type=int, required=True)
+    internal.add_argument("--lock-fd", type=int)
+    internal.add_argument("--startup")
     args = parser.parse_args(argv)
     try:
         args.directory = private_directory(args.directory.resolve())
         if args.command == "_run":
+            if args.startup is not None and args.lock_fd is None:
+                fd = claim_startup(args.directory, args.startup)
+            elif args.lock_fd is not None and args.startup is None and not WINDOWS:
+                fd = args.lock_fd
+            else:
+                raise SyncError("startup_failed", "后台启动参数无效。")
             try:
                 run_service(args.directory)
             finally:
-                os.close(args.lock_fd)
+                release_lock(fd)
             return
         if args.command in {"login", "open"}:
             fd = None
@@ -686,10 +859,13 @@ def main(argv=None):
                           "next": "在此官方网页与手机完成登录；配对电视后再启动同步。", "background": BACKGROUND_NOTE}
             finally:
                 if fd is not None:
-                    os.close(fd)
+                    release_lock(fd)
         elif args.command in {"start", "once"}:
-            fd = claim_lock(args.directory)
+            fd = launch_fd = None
             try:
+                if WINDOWS and args.command == "start":
+                    launch_fd = claim_lock(args.directory, "start.lock")
+                fd = claim_lock(args.directory)
                 load_config(args.directory, args)
                 (args.directory / "stop.json").unlink(missing_ok=True)
                 if args.command == "once":
@@ -699,14 +875,15 @@ def main(argv=None):
                         result = service.synchronize()
                 else:
                     private_write(args.directory / "status.json", {"state": "starting", "observed_at": timestamp()})
-                    subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "--directory",
-                        str(args.directory), "_run", "--lock-fd", str(fd)], pass_fds=(fd,),
-                        env=clean_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        start_new_session=True)
+                    inherited = fd
+                    fd = None
+                    start_background(args.directory, inherited)
                     result = {"started": True, "read_only": args.read_only, "background": BACKGROUND_NOTE}
             finally:
-                # Closing our duplicate keeps the child's inherited flock held.
-                os.close(fd)
+                if fd is not None:
+                    release_lock(fd)
+                if launch_fd is not None:
+                    release_lock(launch_fd)
         elif args.command == "stop":
             active = running(args.directory)
             if active:

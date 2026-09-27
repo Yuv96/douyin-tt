@@ -595,8 +595,8 @@ class ActionWorker:
         self.report("stopped")
 
 
-def start_worker(web, directory):
-    worker = ActionWorker(web, directory)
+def start_worker(web, directory, stop=None):
+    worker = ActionWorker(web, directory, stop=stop)
     thread = threading.Thread(target=worker.run, name="official-browser-actions", daemon=True)
     thread.start()
     return worker, thread

@@ -1,35 +1,13 @@
-# 电脑同步工具
+# 电脑同步
 
-电脑保留官方抖音网页登录会话，为电视提供凭证同步和网页操作执行。
+需要 Python 3.10+（含 Tk）；Windows 另需 WebView2 Runtime。
 
-## 准备
+1. 在 GitHub Actions 手动运行 **Desktop checks and launchers**，勾选 `package_launchers`，下载并解压产物。
+2. macOS 双击 `抖音TT.app`，Windows 双击 `start_douyin_tt.bat`。启动器须与项目文件放在一起；首次联网准备依赖。
+3. 电视开启“电脑同步”，在电脑填入电视 IP，点击“连接”。核对六位配对码，在电视允许；通过“登录网页”完成官方登录。
 
-需要 Python 3.10+，依赖见 [requirements-sync.txt](requirements-sync.txt)。从仓库根目录安装预编译依赖：
+“停止”暂停同步并保留网页；“退出”关闭本工具的浏览器和同步进程。“解除配对”只清除本机配对，保留电视账号。不会开机自启，启动后也不会自动连接。
 
-```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -B -m pip install --only-binary=:all: --no-compile \
-  --target .local-debug/python -r companion/requirements-sync.txt
-export PYTHONPATH="$PWD/.local-debug/python${PYTHONPATH:+:$PYTHONPATH}"
-python3 -B companion/agent_webview_sync.py login
-```
+依赖在 `.runtime/`，会话在 `.local-debug/`，均不入库。电脑需保持运行；休眠或官网要求验证时需恢复会话。
 
-在打开的官方网页与手机上完成登录。
-
-## 配对与运行
-
-电视打开“账号与登录 → 电脑同步”，保持页面在前台。将命令中的占位符替换为电视页面显示的地址：
-
-```sh
-python3 -B companion/agent_webview_sync.py start --ip '电视地址' --pair
-python3 -B companion/agent_webview_sync.py status
-```
-
-核对两端六位数字一致后，在电视允许。后续启动省略 `--pair`，复用已保存的配对。
-
-```sh
-python3 -B companion/agent_webview_sync.py stop
-```
-
-`stop` 停止同步并保留浏览器会话。运行资料位于忽略目录 `.local-debug/`，不要提交或上传。电脑休眠、退出或官网要求验证时，需要恢复会话。
-
-互动由用户在电视明确发起，不自动重发不确定的写入。分享能力就绪不代表真实送达已验证。所有测试仅在 GitHub Actions 执行，见[开发说明](../docs/development.md)。
+命令行入口为 `companion/agent_webview_sync.py`，支持 `login`、`start --ip '电视地址' --pair`、`status` 和 `stop`。检查仅在 GitHub Actions 执行。
