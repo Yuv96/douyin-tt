@@ -1,0 +1,15 @@
+第三方来源与许可
+
+基础软件：GPL-3.0。
+固定来源与校验值：android/build.py
+许可证：LICENSE
+
+LibVLC 3.7.6 — VideoLAN，LGPL-2.1。
+来源：https://code.videolan.org/videolan/vlc-android
+许可证：android/LIBVLC-LICENSE.txt
+构建同时取得对应版本的 Java 绑定源码包。
+
+Douyin IM 协议参考 — Zhin.js contributors，MIT。
+来源：https://github.com/zhinjs/douyin-im
+参考提交：e4ff73c43d3599a40091bd18cf794af36af466fb
+许可证：android/DOUYIN-IM-LICENSE.txt

@@ -1,0 +1,10 @@
+dist/
+
+dist-test/
+evidence/
+*.p12
+*.jks
+*.keystore
+__pycache__/
+.local-debug/
+.DS_Store
