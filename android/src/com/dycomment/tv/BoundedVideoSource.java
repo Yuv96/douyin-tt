@@ -22,7 +22,9 @@ final class BoundedVideoSource implements Closeable {
     private final ThreadPoolExecutor clients = new ThreadPoolExecutor(2, 2, 0,
             TimeUnit.MILLISECONDS, new ArrayBlockingQueue<Runnable>(2),
             new ThreadPoolExecutor.AbortPolicy());
-    private final ExecutorService canceller = Executors.newSingleThreadExecutor();
+    private final ExecutorService canceller = new ThreadPoolExecutor(1, 1, 0,
+            TimeUnit.MILLISECONDS, new ArrayBlockingQueue<Runnable>(8),
+            new ThreadPoolExecutor.AbortPolicy());
     private final Set<Socket> sockets = Collections.synchronizedSet(new HashSet<Socket>());
     private final Set<HttpURLConnection> cancelling = Collections.synchronizedSet(new HashSet<HttpURLConnection>());
     private ServerSocket server;
@@ -93,9 +95,8 @@ final class BoundedVideoSource implements Closeable {
         if (previous != null) cancel(previous);
         final Socket[] old;
         synchronized (sockets) { old = sockets.toArray(new Socket[0]); }
-        if (old.length > 0 && !canceller.isShutdown()) canceller.execute(() -> {
-            for (Socket socket : old) try { socket.close(); } catch (IOException ignored) { }
-        });
+        // Loopback sockets have no linger; close is bounded and wakes any blocked writer.
+        for (Socket socket : old) try { socket.close(); } catch (IOException ignored) { }
     }
 
     synchronized void pausePrefetch() {
@@ -133,6 +134,8 @@ final class BoundedVideoSource implements Closeable {
             } catch (IOException failure) {
                 if (!closed && !e.disposed && prefetchAllowed
                         && e.backgroundTicket == prefetchGeneration) e.failed = true;
+            } catch (RuntimeException malformed) {
+                e.failed = true;
             } finally {
                 synchronized (BoundedVideoSource.this) {
                     e.running = false;
@@ -149,11 +152,18 @@ final class BoundedVideoSource implements Closeable {
             for (HttpURLConnection c : e.connections) if (cancelling.add(c)) fresh.add(c);
             pending = fresh.toArray(new HttpURLConnection[0]);
         }
-        if (pending.length > 0 && !canceller.isShutdown()) canceller.execute(() -> {
-            for (HttpURLConnection c : pending) {
-                try { c.disconnect(); } finally { cancelling.remove(c); }
+        if (pending.length > 0) {
+            try {
+                canceller.execute(() -> {
+                    for (HttpURLConnection c : pending) {
+                        try { c.disconnect(); } finally { cancelling.remove(c); }
+                    }
+                });
+            } catch (RejectedExecutionException busy) {
+                // Upstream reads/connects retain finite deadlines. Never run disconnect on UI.
+                for (HttpURLConnection c : pending) cancelling.remove(c);
             }
-        });
+        }
     }
 
     private void ensureServer() throws IOException {
@@ -268,7 +278,7 @@ final class BoundedVideoSource implements Closeable {
                 start += n;
                 out.flush();
             }
-        } catch (IOException | InterruptedException | IllegalArgumentException ignored) {
+        } catch (IOException | InterruptedException | RuntimeException ignored) {
             // A disconnected range produces a native player error. No recursive retry here.
         } finally { requestEpoch.remove(); sockets.remove(socket); }
     }
@@ -393,8 +403,8 @@ final class BoundedVideoSource implements Closeable {
                     direct = true; initialized = true; return;
                 }
                 long offset = 0;
-                for (int boxes = 0; boxes < 32 && offset + 8 <= size; boxes++) {
-                    byte[] header = offset + 16 <= head.length
+                for (int boxes = 0; boxes < 32 && offset <= size - 8; boxes++) {
+                    byte[] header = offset <= head.length - 16
                         ? Arrays.copyOfRange(head, (int)offset, (int)offset+16)
                         : fetch(offset, (int)Math.min(16, size-offset), background);
                     long length = uint(header, 0);
@@ -423,7 +433,9 @@ final class BoundedVideoSource implements Closeable {
                     // Demuxers may probe a suffix beginning just before the tail index.
                     // Serve this small complete metadata window before the interest gate.
                     metadataAt = Math.max(0, moovAt - 65536);
-                    int count = (int)(Math.min(size, moovAt + moov.length + 65536) - metadataAt);
+                    long metadataEnd = moovAt + moov.length;
+                    metadataEnd += Math.min(65536, size - metadataEnd);
+                    int count = (int)(metadataEnd - metadataAt);
                     metadata = fetch(metadataAt, count, background);
                 }
                 // Account for the separate metadata copy as well as all prefix disk bytes.

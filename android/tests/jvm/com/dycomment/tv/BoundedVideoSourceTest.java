@@ -22,11 +22,13 @@ public final class BoundedVideoSourceTest {
 
     public static void main(String[] args) throws Exception {
         String[] names = {"ten-second cache and switch hit", "ten-MiB and two-entry budget",
-                "position and explicit-seek gate", "valid and malformed client ranges",
+                "position and explicit-seek gate", "high-bitrate reachable resume gate",
+                "tail metadata before playback", "valid and malformed client ranges",
                 "cancel retains committed blocks", "superseded prefetch stays cancelled",
                 "failure has no automatic retry", "stale sockets and bounded workers"};
         Case[] cases = {BoundedVideoSourceTest::timeWindow, BoundedVideoSourceTest::byteBudget,
-                BoundedVideoSourceTest::playbackGate, BoundedVideoSourceTest::ranges,
+                BoundedVideoSourceTest::playbackGate, BoundedVideoSourceTest::highBitrateGate,
+                BoundedVideoSourceTest::tailMetadata, BoundedVideoSourceTest::ranges,
                 BoundedVideoSourceTest::partialCancellation, BoundedVideoSourceTest::supersededPrefetch,
                 BoundedVideoSourceTest::noRetry, BoundedVideoSourceTest::socketLifecycle};
         int failures = 0;
@@ -149,6 +151,73 @@ public final class BoundedVideoSourceTest {
                 try (Reply reply = get(env.source.select(direct.url), bad)) {
                     reply.expectRejected(); // No redirect may bypass syntax or semantic validation.
                 }
+            }
+        }
+    }
+
+    private static void highBitrateGate() throws Exception {
+        try (Environment env = new Environment()) {
+            int sampleBytes = 4 * 1024 * 1024;
+            Route video = env.origin.add("high-bitrate-gate", new Movie(sampleBytes, 24, 61));
+            env.source.prefetch(video.url);
+            await(() -> env.source.cachedBytes(video.url) == video.movie.limit, "high-bitrate prefix");
+            // Each fixture sample lasts one second. Only two complete samples fit;
+            // calculate their playable duration independently of the production parser/gate.
+            long playableSeconds = (video.movie.limit - video.movie.dataAt) / sampleBytes;
+            require(playableSeconds == 2, "fixture must exhaust ten MiB before five playable seconds");
+            long halfwayMs = playableSeconds * 1000 / 2;
+            require(halfwayMs == 1000, "fixture halfway position");
+            String selected = env.source.select(video.url);
+            int before = video.requests.size();
+            long offset = video.movie.limit;
+            try (Reply reply = get(selected, "bytes=" + offset + "-" + (offset + 31))) {
+                require(reply.status == 206, "high-bitrate held range status");
+                reply.expectWaiting();
+                env.source.position(halfwayMs - 1);
+                reply.expectWaiting();
+                require(video.requests.size() == before, "high-bitrate gate opened before halfway");
+                env.source.position(halfwayMs);
+                equal(reply.read(32), video.movie.bytes(offset, 32),
+                        "high-bitrate gate waited for unreachable five-second position");
+            }
+            require(video.requests.size() == before + 1, "high-bitrate forward was not a single request");
+            require(env.source.cachedBytes(video.url) == video.movie.limit, "high-bitrate forward grew cache");
+        }
+    }
+
+    private static void tailMetadata() throws Exception {
+        try (Environment env = new Environment()) {
+            Route video = env.origin.add("tail-moov", new Movie(2 * 1024 * 1024, 24, 67, true));
+            require(video.movie.moovAt + video.movie.moov.length == video.movie.size,
+                    "fixture moov must be at the end of the file");
+            env.source.prefetch(video.url);
+            await(() -> env.source.cachedBytes(video.url) == video.movie.limit, "tail-metadata prefix");
+            require(env.diskBytes() + video.movie.metadataBytes == MAX,
+                    "tail metadata window must consume part of the ten-MiB budget");
+            String selected = env.source.select(video.url);
+            int before = video.requests.size();
+            long from = video.movie.moovAt - 1;
+            require(from > video.movie.limit, "tail metadata must be beyond the held media prefix");
+            try (Reply reply = get(selected, "bytes=" + from + "-")) {
+                require(reply.status == 206, "pre-moov range status");
+                require(("bytes " + from + "-" + (video.movie.size - 1) + "/" + video.movie.size)
+                        .equals(reply.headers.get("content-range")), "pre-moov Content-Range");
+                equal(reply.read(video.movie.moov.length + 1), video.movie.bytes(from, video.movie.moov.length + 1),
+                        "range starting before moov stalled behind playback gate");
+            }
+            try (Reply reply = get(selected, "bytes=-65536")) {
+                require(reply.status == 206 && "65536".equals(reply.headers.get("content-length")),
+                        "tail suffix metadata response");
+                byte[] suffix = reply.read(65536);
+                equal(suffix, video.movie.bytes(video.movie.size - 65536, 65536),
+                        "suffix metadata stalled behind playback gate");
+                equal(Arrays.copyOfRange(suffix, suffix.length - video.movie.moov.length, suffix.length),
+                        video.movie.moov, "suffix omitted complete moov");
+            }
+            require(video.requests.size() == before, "tail metadata was fetched again after selection");
+            try (Reply media = get(selected, "bytes=" + video.movie.limit + "-" + (video.movie.limit + 15))) {
+                media.expectWaiting();
+                require(video.requests.size() == before, "metadata probe unlocked unrelated media");
             }
         }
     }
@@ -423,23 +492,32 @@ public final class BoundedVideoSourceTest {
     /** Fixed one-second samples; expected byte horizons do not call Mp4Window. */
     private static final class Movie {
         final byte[] head, moov;
-        final long size, limit;
+        final long size, limit, dataAt, moovAt;
+        final int metadataBytes;
         final int seed;
         Movie(int sampleSize, int samples, int seed) throws IOException {
+            this(sampleSize, samples, seed, false);
+        }
+        Movie(int sampleSize, int samples, int seed, boolean tailMoov) throws IOException {
             this.seed = seed;
-            byte[] ftyp = box("ftyp", ints(0x69736f6d, 0));
+            byte[] ftyp = box("ftyp", ints(0x69736f6d, seed));
             byte[] initial = moov(sampleSize, samples, 0);
-            long data = ftyp.length + initial.length + 8L;
-            moov = moov(sampleSize, samples, data);
-            head = concat(ftyp, moov, ints(8 + sampleSize * samples, 0x6d646174));
-            size = data + (long) sampleSize * samples;
-            limit = Math.min(data + (long) Math.min(10, samples) * sampleSize, MAX - moov.length);
+            dataAt = ftyp.length + (tailMoov ? 0 : initial.length) + 8L;
+            moov = moov(sampleSize, samples, dataAt);
+            byte[] mdatHeader = ints(8 + sampleSize * samples, 0x6d646174);
+            head = tailMoov ? concat(ftyp, mdatHeader) : concat(ftyp, moov, mdatHeader);
+            moovAt = tailMoov ? dataAt + (long) sampleSize * samples : ftyp.length;
+            size = dataAt + (long) sampleSize * samples + (tailMoov ? moov.length : 0);
+            metadataBytes = moov.length + (tailMoov ? 65536 : 0);
+            limit = Math.min(dataAt + (long) Math.min(10, samples) * sampleSize, MAX - metadataBytes);
         }
         byte[] bytes(long offset, int count) {
             byte[] result = new byte[count];
             for (int i = 0; i < count; i++) {
                 long at = offset + i;
-                result[i] = at < head.length ? head[(int) at] : (byte) (at * 31 + seed);
+                result[i] = at < head.length ? head[(int) at]
+                        : at >= moovAt && at < moovAt + moov.length ? moov[(int) (at - moovAt)]
+                        : (byte) (at * 31 + seed);
             }
             return result;
         }
