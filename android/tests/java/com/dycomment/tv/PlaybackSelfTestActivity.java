@@ -112,7 +112,7 @@ public final class PlaybackSelfTestActivity extends Activity {
                             } catch (Exception failure) { fail("retirement fixture"); return; }
                             switchStarted = android.os.SystemClock.elapsedRealtime();
                             view.setVideoURI(Uri.parse(feedList.get(1).videoUrl));
-                            if (previousPlayer.getVolume() != 0) {
+                            if (previousPlayer.getVolume() > 0) {
                                 fail("retiring video can overlap the next audio");
                                 return;
                             }

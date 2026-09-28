@@ -45,7 +45,7 @@ text=main.read_text()
 if SELF_TEST:
     evidence=ROOT.parent/'evidence'; evidence.mkdir(exist_ok=True)
     dispatch=[]
-    for method in ['playAt', 'playVideo', 'loadVideoDetail', 'refreshAndPlay']:
+    for method in ['playAt', 'playVideo', 'loadVideoDetail', 'refreshAndPlay', 'showLoading', 'hideLoading']:
         body=re.search(rf'(?ms)^\.method [^\n]* {method}\([^\n]*\n.*?^\.end method', text)
         if body: dispatch.append(body.group())
     (evidence/'playback-dispatch.txt').write_text('\n\n'.join(dispatch))
