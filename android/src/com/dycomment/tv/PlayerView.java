@@ -438,6 +438,9 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
             retiring++;
             final long stoppedAt = SystemClock.elapsedRealtime();
             old.setEventListener(null);
+            // The next player may start before asynchronous teardown finishes.
+            // Silence this instance now so queued retirement cannot overlap its audio.
+            old.setVolume(0);
             // Surface access stays on main; blocking native stop never occupies the remote/UI
             // thread.
             old.getVLCVout().detachViews();

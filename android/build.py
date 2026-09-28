@@ -42,6 +42,13 @@ for file in package.glob('ModernMenuHelper*.smali'): file.unlink()
 assert not list(package.glob('PlayerView*.smali')), 'remove player failed'
 main=package/'MainActivity.smali'
 text=main.read_text()
+if SELF_TEST:
+    evidence=ROOT.parent/'evidence'; evidence.mkdir(exist_ok=True)
+    dispatch=[]
+    for method in ['playAt', 'playVideo', 'loadVideoDetail', 'refreshAndPlay']:
+        body=re.search(rf'(?ms)^\.method [^\n]* {method}\([^\n]*\n.*?^\.end method', text)
+        if body: dispatch.append(body.group())
+    (evidence/'playback-dispatch.txt').write_text('\n\n'.join(dispatch))
 pattern=r'(?ms)^\.method public synthetic lambda\$onCreate\$0\$com-dycomment-tv-MainActivity\(Landroid/media/MediaPlayer;\)V\n.*?^\.end method'
 replacement='''.method public synthetic lambda$onCreate$0$com-dycomment-tv-MainActivity(Landroid/media/MediaPlayer;)V
     .locals 2

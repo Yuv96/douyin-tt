@@ -97,9 +97,12 @@ public final class PlaybackSelfTestActivity extends Activity {
                             currentIndex = 1;
                             outputs = 0;
                             stage = 1;
+                            org.videolan.libvlc.MediaPlayer previousPlayer;
                             // An old decoder can take time to retire. The already-warm next
                             // video must produce a frame without waiting for that teardown.
                             try {
+                                previousPlayer = (org.videolan.libvlc.MediaPlayer)
+                                        InteractionController.field(view, "player");
                                 java.util.concurrent.ThreadPoolExecutor retirement =
                                         (java.util.concurrent.ThreadPoolExecutor) InteractionController.field(view, "retireWorker");
                                 retirement.execute(() -> {
@@ -109,6 +112,10 @@ public final class PlaybackSelfTestActivity extends Activity {
                             } catch (Exception failure) { fail("retirement fixture"); return; }
                             switchStarted = android.os.SystemClock.elapsedRealtime();
                             view.setVideoURI(Uri.parse(feedList.get(1).videoUrl));
+                            if (previousPlayer.getVolume() != 0) {
+                                fail("retiring video can overlap the next audio");
+                                return;
+                            }
                         }
                     } else if (stage == 1 && outputs > 0 && position > 1800) {
                         if (secondRequests.get() != requestsAtSwitch) {
