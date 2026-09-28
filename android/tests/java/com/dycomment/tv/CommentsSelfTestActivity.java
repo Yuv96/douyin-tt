@@ -420,6 +420,12 @@ public final class CommentsSelfTestActivity extends Activity {
     }
 
     private void liveTransparency() throws Exception {
+        for (int i = 0; i < list().getChildCount(); i++) {
+            View row = list().getChildAt(i);
+            require(Math.abs(((TextView) field(row, "body")).getTextSize()
+                            - 2 * ((TextView) field(row, "meta")).getTextSize()) < 0.1f,
+                    "live nicknames remain half the message text size");
+        }
         require(panel.isLive() && panel.getWidth() <= decor.getWidth() * 2 / 5
                         && panel.getRight() == decor.getWidth(),
                 "live chat occupies only a narrow right column");

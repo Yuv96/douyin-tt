@@ -249,7 +249,7 @@ final class CommentsPanel extends FrameLayout {
             setLongClickable(false);
             LinearLayout words = new LinearLayout(a);
             words.setOrientation(VERTICAL);
-            meta = UiTheme.text(a, "", live ? 12 : 10);
+            meta = UiTheme.text(a, "", live ? 9 : 10);
             meta.setTextColor(UiTheme.MUTED);
             body = UiTheme.text(a, "", live ? 18 : 20);
             if (live) {
