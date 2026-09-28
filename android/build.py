@@ -205,6 +205,7 @@ text=text.replace("</application>",'<activity android:name="com.dycomment.tv.Com
 text=text.replace('</application>','<activity android:name="com.dycomment.tv.QuickShareActivity" android:exported="false" />\n<activity android:name="com.dycomment.tv.SurfaceCoverTestActivity" android:exported="false" />\n</application>')
 if SELF_TEST:
     text=text.replace('</application>', '<activity android:name="com.dycomment.tv.LanSyncSelfTestActivity" android:exported="true" />\n</application>')
+    text=text.replace('</application>', '<activity android:name="com.dycomment.tv.FrameSwitchSelfTestActivity" android:exported="true" android:launchMode="singleTop" android:screenOrientation="landscape" />\n</application>')
     text=text.replace('</application>', '<service android:name="com.dycomment.tv.LanSyncSelfTestActivity$FixtureService" android:exported="false" />\n</application>')
     text=text.replace('</application>', '<receiver android:name="com.dycomment.tv.LanPairingConfirmationReceiver" android:exported="true" />\n</application>')
 if not SELF_TEST:
@@ -291,6 +292,10 @@ if SELF_TEST:
         run('ffmpeg','-hide_banner','-loglevel','error','-y','-f','lavfi','-i',f'testsrc2=size={width}x{height}:rate=25',
             '-f','lavfi','-i','sine=frequency=440:sample_rate=44100','-t','16','-c:v','libx264','-preset','veryfast','-crf','30',
             '-profile:v',profile,'-level:v','4.1' if profile=='high' else '3.0','-pix_fmt','yuv420p','-c:a','aac','-b:a','64k','-movflags','+faststart',assets/f'selftest-{name}.mp4')
+    for color,width,height,tone in [('red',640,360,440),('blue',360,640,880)]:
+        run('ffmpeg','-hide_banner','-loglevel','error','-y','-f','lavfi','-i',f'color=c={color}:size={width}x{height}:rate=25',
+            '-f','lavfi','-i',f'sine=frequency={tone}:sample_rate=44100','-t','20','-c:v','libx264','-preset','veryfast','-crf','24',
+            '-profile:v','baseline','-level:v','3.0','-pix_fmt','yuv420p','-c:a','aac','-b:a','64k','-movflags','+faststart',assets/f'selftest-frame-{color}.mp4')
 shutil.copytree(WORK/'vlc/jni',decoded/'lib',dirs_exist_ok=True)
 shipped_abis = ('x86',) if SELF_TEST else ('armeabi-v7a', 'x86')
 for library_dir in (decoded/'lib').iterdir():

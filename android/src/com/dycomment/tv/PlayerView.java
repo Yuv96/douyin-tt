@@ -10,6 +10,7 @@ import android.util.AttributeSet;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.SurfaceView;
+import android.view.View;
 import android.widget.FrameLayout;
 
 import org.videolan.libvlc.LibVLC;
@@ -54,7 +55,29 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
     }
 
     private static LibVLC engine;
-    private final SurfaceView surface;
+    private SurfaceView surface;
+    private final View frameCurtain;
+    private Media displayedMedia;
+    private boolean voutReady;
+    private int frameGeneration;
+    private long displayedBaseline;
+    private SurfaceView frameSurface;
+    private Media frameMedia;
+    private org.videolan.libvlc.MediaPlayer framePlayer;
+    private final Runnable frameProbe = new Runnable() {
+        @Override public void run() {
+            if (detached || videoOutput || player == null || displayedMedia == null
+                    || frameGeneration != generation || frameSurface != surface
+                    || frameMedia != displayedMedia || framePlayer != player) return;
+            // Audio output may be allocated after play(), so enforce silence until a frame exists.
+            player.setVolume(0);
+            org.videolan.libvlc.interfaces.IMedia.Stats stats = displayedMedia.getStats();
+            if (voutReady && stats != null && stats.displayedPictures > displayedBaseline
+                    && surface.getHolder().getSurface().isValid()) {
+                presentFrame();
+            } else main.postDelayed(this, 25);
+        }
+    };
     private final NextVideoCache cache;
     private org.videolan.libvlc.MediaPlayer player;
     private Uri pending;
@@ -109,6 +132,11 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
         setFocusableInTouchMode(true);
         surface = new SurfaceView(c);
         addView(surface, new LayoutParams(-1, -1, Gravity.CENTER));
+        frameCurtain = new View(c);
+        frameCurtain.setBackgroundColor(0xff000000);
+        frameCurtain.setFocusable(false);
+        frameCurtain.setClickable(false);
+        addView(frameCurtain, new LayoutParams(-1, -1));
         cache = new NextVideoCache(c);
     }
 
@@ -120,6 +148,7 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
                             new ArrayList<String>(
                                     Arrays.asList(
                                             "--avcodec-hw=none",
+                                            "--stats",
                                             "--network-caching=1000",
                                             "--file-caching=200",
                                             "--no-video-title-show",
@@ -147,7 +176,6 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
         surfaceResumePosition = -1;
         videoWidth = videoHeight = codedWidth = codedHeight = 0;
         sarNum = sarDen = 1;
-        surface.setLayoutParams(new LayoutParams(-1, -1, Gravity.CENTER));
         state = STATE_PREPARING;
         openedAt = SystemClock.elapsedRealtime();
         selectedAt = openedAt;
@@ -160,13 +188,13 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
 
     private void queueOpen() {
         main.removeCallbacks(openLatest);
-        if (retiring < 2 && !detached && pending != null && state == STATE_PREPARING)
+        if (player == null && retiring < 2 && !detached && pending != null && state == STATE_PREPARING)
             main.postDelayed(
                     openLatest, cache.prefixReady(pending.toString()) ? 16 : 100);
     }
 
     private void openPending() {
-        if (retiring >= 2 || detached || pending == null || state != STATE_PREPARING) return;
+        if (player != null || retiring >= 2 || detached || pending == null || state != STATE_PREPARING) return;
         final Uri uri = pending;
         final Map<String, String> headers = pendingHeaders;
         final int token = generation;
@@ -174,13 +202,16 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
             String original = NextVideoCache.originalUrl(uri.toString());
             warmStart = cache.prefixReady(original);
             Uri source = Uri.parse(cache.playbackUrl(getContext(), original));
+            // A new producer must never inherit buffers from the preceding Surface.
+            surface = new SurfaceView(getContext());
+            addView(surface, 0, new LayoutParams(-1, -1, Gravity.CENTER));
             player = new org.videolan.libvlc.MediaPlayer(engine());
-            attachVideo();
             player.setEventListener(
                     event -> {
                         if (token == generation) handleEvent(event);
                     });
             Media media = new Media(engine(), source);
+            displayedMedia = media; // Keep our own reference until this player's retirement begins.
             media.setHWDecoderEnabled(false, false);
             media.addOption(":avcodec-hw=none");
             // A complete local startup window is already buffered. Do not impose the
@@ -190,7 +221,8 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
             if (ref != null)
                 media.addOption(":http-referrer=" + ref.replace("\r", "").replace("\n", ""));
             player.setMedia(media);
-            media.release();
+            attachVideo();
+            player.setVolume(0);
             setKeepScreenOn(true);
             player.play();
             Log.i("Android5Player", "OPEN decoder=software");
@@ -204,6 +236,8 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
         switch (e.type) {
             case org.videolan.libvlc.MediaPlayer.Event.Playing:
                 state = STATE_PLAYING;
+                Log.i("Android5Player", "PLAYING media_ms=" + (SystemClock.elapsedRealtime() - selectedAt));
+                if (!videoOutput && player != null) player.setVolume(0);
                 if (!prepared) {
                     prepared = true;
                     setPlaybackSpeed(
@@ -221,27 +255,18 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
                 break;
             case org.videolan.libvlc.MediaPlayer.Event.Vout:
                 if (e.getVoutCount() > 0) {
-                    if (!firstFrameLogged) {
-                        firstFrameLogged = true;
-                        Log.i("Android5Player", "FIRST_FRAME media_ms="
-                                + (SystemClock.elapsedRealtime() - selectedAt)
-                                + " warm=" + warmStart);
-                    }
+                    Log.i("Android5Player", "VOUT media_ms=" + (SystemClock.elapsedRealtime() - selectedAt));
+                    voutReady = true;
                     if (surfaceResumePosition >= 0 && player != null) {
                         long position = surfaceResumePosition;
                         surfaceResumePosition = -1;
-                        // Surface destruction disables the video track. On re-enable,
-                        // flush orphaned P frames by decoding from a keyframe to this time.
                         player.setTime(position, false);
+                        org.videolan.libvlc.interfaces.IMedia.Stats stats = displayedMedia.getStats();
+                        displayedBaseline = stats == null ? 0 : stats.displayedPictures;
                         Log.i("Android5Player", "RESTORE_POSITION ms=" + position);
                     }
-                    fitVideo();
-                    videoOutput = true;
-                    stalledAt = 0;
-                    PlaybackCoordinator.ready(getContext());
-                    if (wantPlay && buffer >= 100) cache.scheduleNext(getContext());
-                    Log.i("Android5Player", "VIDEO_OUTPUT count=" + e.getVoutCount());
-                    if (onInfo != null) onInfo.onInfo(null, 3, 0);
+                    main.removeCallbacks(frameProbe);
+                    main.post(frameProbe);
                 }
                 break;
             case org.videolan.libvlc.MediaPlayer.Event.TimeChanged:
@@ -273,6 +298,40 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
                 failPlayback("DECODE_OR_NETWORK_ERROR");
                 break;
         }
+    }
+
+    private void presentFrame() {
+        if (player == null || surface == null || frameGeneration != generation
+                || framePlayer != player || frameMedia != displayedMedia || frameSurface != surface) return;
+        fitVideo();
+        videoOutput = true;
+        stalledAt = 0;
+        frameCurtain.setVisibility(View.GONE);
+        player.setVolume(100);
+        if (!firstFrameLogged) {
+            firstFrameLogged = true;
+            Log.i("Android5Player", "FIRST_FRAME media_ms="
+                    + (SystemClock.elapsedRealtime() - selectedAt) + " warm=" + warmStart);
+        }
+        PlaybackCoordinator.ready(getContext());
+        if (wantPlay && buffer >= 100) cache.scheduleNext(getContext());
+        Log.i("Android5Player", "VIDEO_OUTPUT generation=" + generation);
+        if (onInfo != null) onInfo.onInfo(null, 3, 0);
+    }
+
+    private void watchFrame() {
+        main.removeCallbacks(frameProbe);
+        frameCurtain.setVisibility(View.VISIBLE);
+        videoOutput = false;
+        voutReady = false;
+        frameGeneration = generation;
+        frameSurface = surface;
+        frameMedia = displayedMedia;
+        framePlayer = player;
+        org.videolan.libvlc.interfaces.IMedia.Stats stats = displayedMedia.getStats();
+        displayedBaseline = stats == null ? 0 : stats.displayedPictures;
+        player.setVolume(0);
+        main.post(frameProbe);
     }
 
     private void failPlayback(String reason) {
@@ -313,7 +372,7 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
      * including when Android has not created the new surface yet.
      */
     private void attachVideo() {
-        if (player == null || detached) return;
+        if (player == null || displayedMedia == null || surface == null || detached) return;
         IVLCVout vout = player.getVLCVout();
         if (!vout.areViewsAttached()) {
             final int token = generation;
@@ -321,7 +380,7 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
                 surfaceResumePosition = Math.max(0, player.getTime());
                 cache.position(surfaceResumePosition);
             }
-            videoOutput = false;
+            watchFrame();
             stalledAt = 0;
             openedAt = SystemClock.elapsedRealtime();
             player.setAspectRatio(null);
@@ -432,6 +491,19 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
     private void releasePlayer() {
         generation++;
         main.removeCallbacks(openLatest);
+        main.removeCallbacks(frameProbe);
+        frameCurtain.setVisibility(View.VISIBLE);
+        videoOutput = false;
+        voutReady = false;
+        framePlayer = null;
+        frameMedia = null;
+        frameSurface = null;
+        if (displayedMedia != null) {
+            displayedMedia.release();
+            displayedMedia = null;
+        }
+        final SurfaceView previousSurface = surface;
+        surface = null;
         if (player != null) {
             final org.videolan.libvlc.MediaPlayer old = player;
             player = null;
@@ -468,11 +540,13 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
                                 }
                             });
         }
+        if (previousSurface != null) removeView(previousSurface);
         setKeepScreenOn(false);
     }
 
     public void onNewVideoLayout(
             IVLCVout v, int w, int h, int visibleW, int visibleH, int sn, int sd) {
+        if (player == null || v != player.getVLCVout() || surface == null) return;
         codedWidth = w;
         codedHeight = h;
         videoWidth = visibleW > 0 ? visibleW : w;
@@ -489,7 +563,7 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
 
     private void fitVideo() {
         int w = getWidth(), h = getHeight();
-        if (w <= 0 || h <= 0) return;
+        if (w <= 0 || h <= 0 || surface == null) return;
         if (player != null) {
             player.getVLCVout().setWindowSize(w, h);
         }

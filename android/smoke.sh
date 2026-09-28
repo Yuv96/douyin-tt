@@ -13,6 +13,7 @@ adb shell wm density 160
 adb install -r dist-test/douyin-tt-0.1.5.apk > evidence/test-install.txt
 cat evidence/test-install.txt
 tr -d '\r' < evidence/test-install.txt | grep -qx 'Success'
+bash android/frame_switch_smoke.sh
 # Run the changed UI/engine paths first; the complete playback/comment suite
 # still runs before any production build or publication.
 ui_result=0
