@@ -263,7 +263,7 @@ public final class InteractionController {
             try {
                 View comments = (View) field(a, "commentOverlay");
                 if (comments instanceof CommentsPanel) {
-                    ((CommentsPanel) comments).close(true);
+                    if (!((CommentsPanel) comments).isLive()) ((CommentsPanel) comments).close(true);
                     return true;
                 }
                 if (comments != null && comments.getParent() != null) {
@@ -598,6 +598,21 @@ public final class InteractionController {
         try {
             TextView clock = (TextView) field(a, "tvClock");
             if (clock == null) return;
+            if (clock.getLayoutParams() instanceof android.widget.FrameLayout.LayoutParams) {
+                android.widget.FrameLayout.LayoutParams params =
+                        (android.widget.FrameLayout.LayoutParams) clock.getLayoutParams();
+                int gravity = android.view.Gravity.LEFT | android.view.Gravity.TOP;
+                int inset = ModernMenuHelper.dp(a, 16);
+                if (params.gravity != gravity || params.leftMargin != inset || params.rightMargin != 0
+                        || params.isMarginRelative()) {
+                    params.gravity = gravity;
+                    params.setMarginStart(Integer.MIN_VALUE);
+                    params.setMarginEnd(Integer.MIN_VALUE);
+                    params.leftMargin = inset;
+                    params.rightMargin = 0;
+                    clock.setLayoutParams(params);
+                }
+            }
             boolean showTime = (Boolean) field(a, "showClock");
             String cookie = SocialApi.cookie();
             boolean personal = SocialApi.personalCookie() && CredentialStore.hasSession(cookie);

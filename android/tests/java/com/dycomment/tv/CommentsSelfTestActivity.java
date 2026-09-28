@@ -191,12 +191,25 @@ public final class CommentsSelfTestActivity extends Activity {
                 controllerKey(key);
                 require(controller.panel == null && !ModernMenuHelper.isMenuShowing(),
                         "live reading keys never open the short-video interaction menu");
-                closeReading();
+                View opened = commentOverlay;
+                controllerKey(KeyEvent.KEYCODE_MENU);
+                require(commentOverlay == opened && opened.getParent() == decor,
+                        "MENU keeps the same live column and subscription open");
+                controllerKey(KeyEvent.KEYCODE_BACK);
+                require(commentOverlay == null && !menuShowing,
+                        "BACK explicitly closes the persistent live column");
                 require(!videoView.wantsPlayback() && resumes == before,
                         "live reading ignores stale menu resume flags on manually paused video");
             }
 
             videoView.start();
+            int pausesBefore = pauses;
+            controllerKey(KeyEvent.KEYCODE_MENU);
+            require(videoView.wantsPlayback() && pauses == pausesBefore && resumes == before,
+                    "MENU opens live chat without pausing an active stream");
+            controllerKey(KeyEvent.KEYCODE_BACK);
+            require(videoView.wantsPlayback() && pauses == pausesBefore && resumes == before,
+                    "BACK closes live chat without changing active playback");
             controller.settings();
             require(controller.panel == null && ModernMenuHelper.isMenuShowing()
                             && !videoView.wantsPlayback(), "settings owns live playback pause independently of quick panel");
@@ -406,6 +419,36 @@ public final class CommentsSelfTestActivity extends Activity {
         }
     }
 
+    private void liveTransparency() throws Exception {
+        require(panel.isLive() && panel.getWidth() <= decor.getWidth() * 2 / 5
+                        && panel.getRight() == decor.getWidth(),
+                "live chat occupies only a narrow right column");
+        require(!panel.isClickable() && panel.getElevation() == 0,
+                "live chat has no outside-click dismissal or panel shadow");
+        Bitmap picture = Bitmap.createBitmap(decor.getWidth(), decor.getHeight(), Bitmap.Config.ARGB_8888);
+        try {
+            int videoColor = 0xff407c98;
+            picture.eraseColor(videoColor);
+            Canvas canvas = new Canvas(picture);
+            canvas.translate(panel.getLeft(), panel.getTop());
+            panel.draw(canvas);
+            int[] columns = {1, panel.getLeft() - 1, panel.getLeft() + 1, panel.getRight() - 2};
+            for (int x : columns) for (int y = 1; y < picture.getHeight(); y += 17) {
+                require(picture.getPixel(x, y) == videoColor,
+                        "live video pixels remain undimmed outside text, including column padding");
+            }
+            File directory = getExternalFilesDir(null);
+            if (directory == null) directory = getFilesDir();
+            File screenshot = new File(directory, "live-comments-transparent.png");
+            try (FileOutputStream out = new FileOutputStream(screenshot)) {
+                require(picture.compress(Bitmap.CompressFormat.PNG, 100, out), "save live column screenshot");
+            }
+            Log.i("Android5CommentsTest", "LIVE_SCREENSHOT_PATH=" + screenshot.getCanonicalPath());
+        } finally {
+            picture.recycle();
+        }
+    }
+
     private void requireCircularPixels(ImageView avatar, int centerColor, boolean placeholder) {
         int size = avatar.getWidth();
         Bitmap rendered = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
@@ -474,7 +517,7 @@ public final class CommentsSelfTestActivity extends Activity {
             if (done) return;
             long now = SystemClock.elapsedRealtime();
             try {
-                require(now - started < 65000, "timeout stage=" + stage);
+                require(now - started < 75000, "timeout stage=" + stage);
                 ListView list = list();
                 if (stage == 0 && list.getChildCount() > 1 && !busy()) {
                     require(panel.isFocused() && !list.isFocusable(), "panel owns remote focus");
@@ -581,12 +624,13 @@ public final class CommentsSelfTestActivity extends Activity {
                     commentCredentials();
                     live = new LiveFixture();
                     panel = new CommentsPanel(CommentsSelfTestActivity.this, live);
-                    decor.addView(panel, new ViewGroup.LayoutParams(-1, -1));
+                    decor.addView(panel, panel.windowLayout());
                     require(live.starts == 1, "live panel subscribes exactly once");
                     live.emit(0, 240);
                     stage = 10;
                     stageAt = now;
                 } else if (stage == 10 && now - stageAt > 300) {
+                    liveTransparency();
                     require(list().getCount() == 200, "live reading window retains at most 200 rows");
                     require(panel.isFocused() && list().getSelectedItemPosition() == -1,
                             "live messages remain unfocused and unselected");
@@ -596,6 +640,17 @@ public final class CommentsSelfTestActivity extends Activity {
                         require(((ImageView) field(row, "avatar")).getVisibility() == View.GONE,
                                 "live messages do not add avatars");
                     }
+                    key(KeyEvent.KEYCODE_MENU);
+                    require(panel.getParent() == decor && !live.closed && live.starts == 1,
+                            "focused live column consumes MENU without dismissing or resubscribing");
+                    stage = 16;
+                    stageAt = now;
+                } else if (stage == 16 && now - stageAt > 5500) {
+                    require(panel.getParent() == decor && !live.closed && live.starts == 1,
+                            "live chat remains visible during idle time without auto-collapse");
+                    live.emit(240, 241);
+                    require(list().getCount() == 200,
+                            "persistent live chat continues receiving bounded updates");
                     live.current = false;
                     stage = 11;
                 } else if (stage == 11 && panel.getParent() == null) {

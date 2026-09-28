@@ -32,7 +32,7 @@ if grep -q 'FAIL\|FATAL EXCEPTION' evidence/interaction-test.txt; then exit 1; f
 adb logcat -c
 adb shell am start -W -n com.dycomment.tv.android5/com.dycomment.tv.CommentsSelfTestActivity
 passed=false
-for attempt in $(seq 1 35); do
+for attempt in $(seq 1 40); do
   sleep 2
   adb logcat -d -s Android5CommentsTest:I AndroidRuntime:E > evidence/comments-test.txt
   if grep -q 'FAIL\|FATAL EXCEPTION' evidence/comments-test.txt; then cat evidence/comments-test.txt; exit 1; fi
@@ -40,9 +40,12 @@ for attempt in $(seq 1 35); do
 done
 cat evidence/comments-test.txt
 $passed
-comments_screenshot=$(sed -n 's/.*SCREENSHOT_PATH=//p' evidence/comments-test.txt | tr -d '\r' | tail -n 1)
+comments_screenshot=$(sed -n 's/.*[[:space:]]SCREENSHOT_PATH=//p' evidence/comments-test.txt | tr -d '\r' | tail -n 1)
 test -n "$comments_screenshot"
 adb pull "$comments_screenshot" evidence/comments-populated.png
+live_screenshot=$(sed -n 's/.*[[:space:]]LIVE_SCREENSHOT_PATH=//p' evidence/comments-test.txt | tr -d '\r' | tail -n 1)
+test -n "$live_screenshot"
+adb pull "$live_screenshot" evidence/live-comments-transparent.png
 adb logcat -c
 adb shell am start -W -n com.dycomment.tv.android5/com.dycomment.tv.PlaybackSelfTestActivity
 passed=false

@@ -8,14 +8,21 @@ import java.util.concurrent.*;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.regex.*;
 
-/** Loopback range source. Only the current and next MP4 prefixes are retained. */
+/** Loopback range source with three LRU windows sharing one bounded byte reservation. */
 final class BoundedVideoSource implements Closeable {
     static final long BYTE_LIMIT = 10L * 1024 * 1024;
+    static final long TOTAL_LIMIT = 2 * BYTE_LIMIT;
+    enum CacheMode { MISS, INITIALIZING, PARTIAL, READY, DIRECT, FAILED, CLOSED }
+    enum CacheReason { NONE, CANCELLED, ORIGIN_NO_RANGE, NOT_MP4, INDEX_TOO_LARGE,
+        INDEX_MISSING, INDEX_UNSUPPORTED, ORIGIN_ERROR, INVALID_MEDIA, CACHE_BUSY }
+    private static final class BudgetException extends IOException { }
     static final long OPEN_AFTER_MS = 5000;
     private static final int BLOCK = 128 * 1024, MAX_MOOV = 1024 * 1024;
     private final File directory;
     private final String agent;
     private final LinkedHashMap<String, Entry> entries = new LinkedHashMap<String, Entry>();
+    private final Set<Entry> retired = new HashSet<Entry>();
+    private long budget;
     private final ThreadPoolExecutor fetcher = new ThreadPoolExecutor(1, 1, 0,
             TimeUnit.MILLISECONDS, new ArrayBlockingQueue<Runnable>(1),
             new ThreadPoolExecutor.AbortPolicy());
@@ -31,7 +38,7 @@ final class BoundedVideoSource implements Closeable {
     private volatile Entry active;
     private volatile boolean closed, prefetchAllowed;
     private volatile int selection, prefetchGeneration;
-    private Entry wanted;
+    private volatile Entry wanted;
     private String accessId;
     private final ThreadLocal<Integer> requestEpoch = new ThreadLocal<Integer>();
 
@@ -46,21 +53,13 @@ final class BoundedVideoSource implements Closeable {
     private synchronized Entry entry(String url) throws IOException {
         String key = key(url);
         Entry e = entries.get(key);
-        if (e != null) return e;
-        new URL(url); // fail before creating a cache entry
-        if (entries.size() >= 2) {
-            Iterator<Entry> iterator = entries.values().iterator();
-            while (iterator.hasNext()) {
-                Entry old = iterator.next();
-                if (old != active) {
-                    old.disposed = true;
-                    old.file.delete();
-                    iterator.remove();
-                    cancel(old);
-                    break;
-                }
-            }
+        if (e != null) {
+            entries.remove(key);
+            entries.put(key, e);
+            return e;
         }
+        new URL(url); // fail before creating a cache entry
+        if (entries.size() >= 3) evictOldest(null);
         e = new Entry(url);
         entries.put(key, e);
         return e;
@@ -69,8 +68,16 @@ final class BoundedVideoSource implements Closeable {
     private static String key(String url) { return url.replaceFirst("^https?://", ""); }
 
     synchronized String select(String url) throws IOException {
-        deselect();
-        active = entry(url);
+        if (closed) throw new IOException("source closed");
+        Entry next = entry(url);
+        selection++;
+        active = next;
+        prefetchAllowed = false;
+        wanted = null;
+        prefetchGeneration++;
+        // Promote the existing background writer instead of disconnecting its range.
+        for (Entry e : entries.values()) cancel(e, e == next);
+        closeClients();
         accessId = UUID.randomUUID().toString();
         active.unlocked = false;
         ensureServer();
@@ -93,6 +100,17 @@ final class BoundedVideoSource implements Closeable {
         active = null;
         pausePrefetch();
         if (previous != null) cancel(previous);
+        closeClients();
+    }
+
+    synchronized void transition() {
+        selection++;
+        active = null;
+        for (Entry e : entries.values()) cancel(e, e == wanted);
+        closeClients();
+    }
+
+    private void closeClients() {
         final Socket[] old;
         synchronized (sockets) { old = sockets.toArray(new Socket[0]); }
         // Loopback sockets have no linger; close is bounded and wakes any blocked writer.
@@ -112,6 +130,10 @@ final class BoundedVideoSource implements Closeable {
         if (closed) return;
         try {
             Entry e = entry(url);
+            if (wanted != e) {
+                prefetchGeneration++;
+                for (Entry old : entries.values()) if (old != active && old != e) cancel(old);
+            }
             wanted = e;
             prefetchAllowed = true;
             enqueue(e);
@@ -130,11 +152,18 @@ final class BoundedVideoSource implements Closeable {
             } catch (InterruptedIOException cancelled) {
                 // Cancellation keeps committed blocks and does not consume a retry.
                 if (!closed && !e.disposed && prefetchAllowed
-                        && e.backgroundTicket == prefetchGeneration) e.failed = true;
+                        && e.backgroundTicket == prefetchGeneration) {
+                    e.reason = CacheReason.ORIGIN_ERROR;
+                    e.failed = true;
+                } else e.reason = CacheReason.CANCELLED;
             } catch (IOException failure) {
                 if (!closed && !e.disposed && prefetchAllowed
-                        && e.backgroundTicket == prefetchGeneration) e.failed = true;
+                        && e.backgroundTicket == prefetchGeneration) {
+                    e.reason = failure instanceof BudgetException ? CacheReason.CACHE_BUSY : CacheReason.ORIGIN_ERROR;
+                    e.failed = true;
+                } else e.reason = CacheReason.CANCELLED;
             } catch (RuntimeException malformed) {
+                e.reason = CacheReason.INVALID_MEDIA;
                 e.failed = true;
             } finally {
                 synchronized (BoundedVideoSource.this) {
@@ -146,17 +175,30 @@ final class BoundedVideoSource implements Closeable {
     }
 
     private void cancel(Entry e) {
+        cancel(e, false);
+    }
+
+    private void cancel(Entry e, boolean preserveBackground) {
         final HttpURLConnection[] pending;
         synchronized (e.connections) {
             List<HttpURLConnection> fresh = new ArrayList<HttpURLConnection>();
-            for (HttpURLConnection c : e.connections) if (cancelling.add(c)) fresh.add(c);
+            for (HttpURLConnection c : e.connections)
+                if ((!preserveBackground || !e.backgroundConnections.contains(c)) && cancelling.add(c)) fresh.add(c);
             pending = fresh.toArray(new HttpURLConnection[0]);
         }
         if (pending.length > 0) {
             try {
                 canceller.execute(() -> {
                     for (HttpURLConnection c : pending) {
-                        try { c.disconnect(); } finally { cancelling.remove(c); }
+                        try {
+                            boolean promoted;
+                            synchronized (e.connections) {
+                                promoted = !closed && !e.disposed && e.backgroundConnections.contains(c)
+                                        && (e == active || (prefetchAllowed && e == wanted
+                                            && e.backgroundTicket == prefetchGeneration));
+                            }
+                            if (!promoted) c.disconnect();
+                        } finally { cancelling.remove(c); }
                     }
                 });
             } catch (RejectedExecutionException busy) {
@@ -300,6 +342,87 @@ final class BoundedVideoSource implements Closeable {
         synchronized (this) { Entry e = entries.get(key(url)); return e == null ? 0 : e.prefix; }
     }
 
+    synchronized CacheMode cacheMode(String url) {
+        if (closed) return CacheMode.CLOSED;
+        if (url == null || url.isEmpty()) return CacheMode.MISS;
+        Entry e = entries.get(key(url));
+        if (e == null) return CacheMode.MISS;
+        if (e.initialized && e.direct) return CacheMode.DIRECT;
+        if (e.failed) return CacheMode.FAILED;
+        if (e.initialized && e.prefix >= e.limit) return CacheMode.READY;
+        return e.prefix > 0 ? CacheMode.PARTIAL : CacheMode.INITIALIZING;
+    }
+
+    synchronized CacheReason cacheReason(String url) {
+        if (url == null || url.isEmpty()) return CacheReason.NONE;
+        Entry e = entries.get(key(url));
+        return e == null ? CacheReason.NONE : e.reason;
+    }
+
+    synchronized long budgetBytes() { return budget; }
+
+    // Only workers reserve bytes. UI methods never wait for Entry.io or a network call.
+    private synchronized void reserve(Entry e, long bytes, boolean background) throws IOException {
+        if (bytes < 0 || bytes > BYTE_LIMIT) throw new IOException("invalid reservation");
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(4);
+        while (true) {
+            e.allowed(background);
+            reclaim();
+            if (budget <= TOTAL_LIMIT - bytes) {
+                budget += bytes;
+                e.charged += bytes;
+                return;
+            }
+            if (evictOldest(e)) continue;
+            if (retired.isEmpty() || System.nanoTime() >= deadline) throw new BudgetException();
+            try { wait(50); }
+            catch (InterruptedException cancelled) {
+                Thread.currentThread().interrupt();
+                throw new InterruptedIOException("reservation cancelled");
+            }
+        }
+    }
+
+    private boolean evictOldest(Entry requesting) {
+        Iterator<Entry> iterator = entries.values().iterator();
+        while (iterator.hasNext()) {
+            Entry victim = iterator.next();
+            if (victim == active || victim == requesting) continue;
+            iterator.remove();
+            victim.disposed = true;
+            retired.add(victim);
+            if (wanted == victim) wanted = null;
+            cancel(victim);
+            reclaim();
+            return true;
+        }
+        return false;
+    }
+
+    private void reclaim() {
+        for (Entry e : new ArrayList<Entry>(retired)) {
+            // Never block with the manager lock: workers acquire Entry.io before manager.
+            if (!e.io.tryLock()) continue;
+            try { settle(e); }
+            finally { e.io.unlock(); }
+        }
+    }
+
+    private synchronized void settle(Entry e) {
+        if (e.disposed) {
+            e.moov = new byte[0];
+            e.metadata = new byte[0];
+            if (!e.file.exists() || e.file.delete()) e.prefix = 0;
+        }
+        // A failed local write can leave a partial block beyond the committed prefix.
+        // Keep those physical bytes charged until overwritten or deleted as well.
+        long retained = Math.max(e.prefix, e.file.length()) + e.metadata.length;
+        budget += retained - e.charged;
+        e.charged = retained;
+        if (e.disposed && retained == 0) retired.remove(e);
+        notifyAll();
+    }
+
     boolean prefixReady(String url) {
         synchronized (this) {
             Entry e = entries.get(key(url));
@@ -311,6 +434,8 @@ final class BoundedVideoSource implements Closeable {
         closed = true;
         deselect();
         for (Entry e : entries.values()) { e.disposed = true; cancel(e); }
+        retired.addAll(entries.values());
+        reclaim();
         try { if (server != null) server.close(); } catch (IOException ignored) { }
         fetcher.shutdownNow();
         clients.shutdownNow();
@@ -322,6 +447,9 @@ final class BoundedVideoSource implements Closeable {
         final File file = new File(directory, id + ".prefix");
         final ReentrantLock io = new ReentrantLock(true);
         final Set<HttpURLConnection> connections = new HashSet<HttpURLConnection>();
+        final Set<HttpURLConnection> backgroundConnections = new HashSet<HttpURLConnection>();
+        long charged;
+        volatile CacheReason reason = CacheReason.NONE;
         volatile boolean disposed, unlocked, initialized, direct, running, failed;
         volatile int backgroundTicket;
         volatile long size = -1, prefix, limit;
@@ -343,7 +471,10 @@ final class BoundedVideoSource implements Closeable {
         HttpURLConnection connect(long first, long last, boolean background) throws IOException {
             allowed(background);
             HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-            synchronized (connections) { connections.add(c); }
+            synchronized (connections) {
+                connections.add(c);
+                if (background) backgroundConnections.add(c);
+            }
             try {
                 c.setConnectTimeout(4000);
                 c.setReadTimeout(3000);
@@ -356,6 +487,7 @@ final class BoundedVideoSource implements Closeable {
                 allowed(background);
                 if (code == 200 && size < 0 && first == 0) {
                     direct = true; // streaming formats or origins without byte ranges stay native
+                    reason = CacheReason.ORIGIN_NO_RANGE;
                     return c;
                 }
                 if (code != 206) throw new IOException("range rejected");
@@ -379,10 +511,11 @@ final class BoundedVideoSource implements Closeable {
 
         void disconnect(HttpURLConnection c) {
             c.disconnect();
-            synchronized (connections) { connections.remove(c); }
+            synchronized (connections) { connections.remove(c); backgroundConnections.remove(c); }
         }
 
         byte[] fetch(long offset, int count, boolean background) throws IOException {
+            reserve(this, count, background);
             HttpURLConnection c = connect(offset, offset + count - 1L, background);
             try {
                 if (direct) return new byte[0];
@@ -402,20 +535,25 @@ final class BoundedVideoSource implements Closeable {
         }
 
         void initialize(boolean background) throws IOException {
+            allowed(background);
+            if (initialized) return; // Cached reads must not wait for a background network fill.
             io.lock();
             try {
                 allowed(background);
                 if (initialized) return;
+                reason = CacheReason.NONE;
                 byte[] head = fetch(0, 4096, background);
                 if (direct) { initialized = true; return; }
                 if (head.length < 12 || type(head, 4) != 0x66747970) {
-                    direct = true; initialized = true; return;
+                    direct = true; reason = CacheReason.NOT_MP4; initialized = true; return;
                 }
                 long offset = 0;
                 for (int boxes = 0; boxes < 32 && offset <= size - 8; boxes++) {
-                    byte[] header = offset <= head.length - 16
-                        ? Arrays.copyOfRange(head, (int)offset, (int)offset+16)
-                        : fetch(offset, (int)Math.min(16, size-offset), background);
+                    byte[] header;
+                    if (offset <= head.length - 16) {
+                        reserve(this, 16, background);
+                        header = Arrays.copyOfRange(head, (int)offset, (int)offset+16);
+                    } else header = fetch(offset, (int)Math.min(16, size-offset), background);
                     long length = uint(header, 0);
                     if (length == 1) {
                         if (header.length < 16 || (header[8] & 128) != 0) throw new IOException("box overflow");
@@ -423,19 +561,26 @@ final class BoundedVideoSource implements Closeable {
                     } else if (length == 0) length = size-offset;
                     if (length < 8 || length > size-offset) throw new IOException("invalid box");
                     if (type(header, 4) == 0x6d6f6f76) {
-                        if (length > MAX_MOOV) { direct = true; break; }
+                        if (length > MAX_MOOV) { direct = true; reason = CacheReason.INDEX_TOO_LARGE; break; }
                         moovAt = offset;
-                        moov = offset+length <= head.length
-                            ? Arrays.copyOfRange(head, (int)offset, (int)(offset+length))
-                            : fetch(offset, (int)length, background);
+                        if (offset+length <= head.length) {
+                            reserve(this, length, background);
+                            moov = Arrays.copyOfRange(head, (int)offset, (int)(offset+length));
+                        } else moov = fetch(offset, (int)length, background);
                         break;
                     }
                     offset += length;
                 }
-                if (moov.length == 0) { direct = true; initialized = true; return; }
+                if (moov.length == 0) {
+                    direct = true;
+                    if (reason == CacheReason.NONE) reason = CacheReason.INDEX_MISSING;
+                    initialized = true; return;
+                }
                 long end;
                 try { end = Mp4Window.prefixEnd(moov, size, 10); }
-                catch (IOException unsupported) { direct = true; initialized = true; return; }
+                catch (IOException unsupported) {
+                    direct = true; reason = CacheReason.INDEX_UNSUPPORTED; initialized = true; return;
+                }
                 metadataAt = moovAt;
                 metadata = moov;
                 if (moovAt >= head.length) {
@@ -462,12 +607,18 @@ final class BoundedVideoSource implements Closeable {
                 moov = new byte[0];
                 int initial = (int)Math.min(head.length, limit);
                 if (prefix == 0) {
-                    try (OutputStream out = new FileOutputStream(file)) { out.write(head, 0, initial); }
-                    prefix = initial;
+                    synchronized (BoundedVideoSource.this) {
+                        allowed(background);
+                        try (OutputStream out = new FileOutputStream(file)) { out.write(head, 0, initial); }
+                        prefix = initial;
+                    }
                 }
                 initialized = true;
+                failed = false;
             } finally {
-                if (disposed) file.delete();
+                moov = new byte[0];
+                if (!initialized || direct) metadata = new byte[0];
+                settle(this);
                 io.unlock();
             }
         }
@@ -479,13 +630,18 @@ final class BoundedVideoSource implements Closeable {
                 if (prefix >= limit) return;
                 byte[] data = fetch(prefix, (int)Math.min(BLOCK, limit-prefix), background);
                 allowed(background);
-                try (RandomAccessFile out = new RandomAccessFile(file, "rw")) {
-                    out.seek(prefix);
-                    out.write(data);
+                synchronized (BoundedVideoSource.this) {
+                    allowed(background);
+                    try (RandomAccessFile out = new RandomAccessFile(file, "rw")) {
+                        out.seek(prefix);
+                        out.write(data);
+                    }
+                    prefix += data.length;
+                    reason = CacheReason.NONE;
+                    failed = false;
                 }
-                prefix += data.length;
             } finally {
-                if (disposed) file.delete();
+                settle(this);
                 io.unlock();
             }
         }

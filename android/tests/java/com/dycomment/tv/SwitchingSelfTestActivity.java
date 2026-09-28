@@ -318,11 +318,11 @@ public final class SwitchingSelfTestActivity extends Activity
                                 if ((clockParams.gravity
                                                 & android.view.Gravity
                                                         .RELATIVE_HORIZONTAL_GRAVITY_MASK)
-                                        != android.view.Gravity.RIGHT
+                                        != android.view.Gravity.LEFT
                                         || (clockParams.gravity
                                                         & android.view.Gravity.VERTICAL_GRAVITY_MASK)
                                                 != android.view.Gravity.TOP)
-                                    throw new Exception("clock is not at the top-right corner");
+                                    throw new Exception("clock is not at the top-left corner");
                                 InteractionController.field(feed, "showClock", true);
                                 InteractionController.updateClock(feed);
                                 android.widget.TextView clock =

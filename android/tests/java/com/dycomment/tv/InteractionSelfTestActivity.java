@@ -210,6 +210,7 @@ public final class InteractionSelfTestActivity extends Activity {
                     .postDelayed(
                             () -> {
                                 try {
+                                    FollowedLiveSelfTest.run(this);
                                     android.view.ViewGroup decor =
                                             (android.view.ViewGroup) getWindow().getDecorView();
                                     CommentsPanel comments = new CommentsPanel(this, "fixture");
@@ -315,6 +316,13 @@ public final class InteractionSelfTestActivity extends Activity {
 
     private void requireCapsule(String status) {
         String label = tvClock.getText().toString();
+        android.widget.FrameLayout.LayoutParams position =
+                (android.widget.FrameLayout.LayoutParams) tvClock.getLayoutParams();
+        require(position.gravity == (android.view.Gravity.LEFT | android.view.Gravity.TOP)
+                        && position.leftMargin == ModernMenuHelper.dp(this, 16)
+                        && position.rightMargin == 0 && !position.isMarginRelative()
+                        && position.topMargin == ModernMenuHelper.dp(this, 12),
+                "clock capsule moves to upper left and preserves vertical inset");
         require(tvClock.getVisibility() == android.view.View.VISIBLE,
                 "account capsule remains visible");
         require(label.endsWith("\u2002\u2002|\u2002\u2002" + status),
@@ -335,7 +343,13 @@ public final class InteractionSelfTestActivity extends Activity {
     private void verifyClockCapsule() throws Exception {
         android.view.ViewGroup decor = (android.view.ViewGroup) getWindow().getDecorView();
         tvClock = new TextView(this);
-        decor.addView(tvClock);
+        android.widget.FrameLayout.LayoutParams oldPosition =
+                new android.widget.FrameLayout.LayoutParams(-2, -2,
+                        android.view.Gravity.RIGHT | android.view.Gravity.TOP);
+        oldPosition.rightMargin = ModernMenuHelper.dp(this, 16);
+        oldPosition.setMarginEnd(ModernMenuHelper.dp(this, 16));
+        oldPosition.topMargin = ModernMenuHelper.dp(this, 12);
+        decor.addView(tvClock, oldPosition);
         TextView obsoleteBanner = new TextView(this);
         obsoleteBanner.setId(0x7f0f7a58);
         decor.addView(obsoleteBanner);

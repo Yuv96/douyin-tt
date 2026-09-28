@@ -22,6 +22,8 @@ public final class NextVideoCache {
     private long nextAllowed;
     private boolean resolving, closed;
     private String scheduledUrl;
+    private String playingUrl;
+    private BoundedVideoSource.CacheMode loggedMode;
     private Runnable delayed;
 
     public NextVideoCache(Context context) {
@@ -53,26 +55,51 @@ public final class NextVideoCache {
         } catch (Exception ignored) { }
         long bytes = source.cachedBytes(url);
         String result = source.select(url);
-        Log.i("NextVideoCache", "PREFIX_OPEN hit=" + (bytes > 0) + " bytes=" + bytes);
+        playingUrl = url;
+        loggedMode = null;
+        Log.i("NextVideoCache", "PREFIX_OPEN hit=" + (bytes > 0) + " bytes=" + bytes
+                + " mode=" + source.cacheMode(url) + " reason=" + source.cacheReason(url));
         return result;
     }
 
-    public void position(long ms) { source.position(ms); }
+    public void position(long ms) {
+        source.position(ms);
+        if (playingUrl != null) {
+            BoundedVideoSource.CacheMode mode = source.cacheMode(playingUrl);
+            if (mode != loggedMode) {
+                loggedMode = mode;
+                Log.i("NextVideoCache", "CACHE_STATE mode=" + mode + " reason="
+                        + source.cacheReason(playingUrl) + " bytes=" + source.cachedBytes(playingUrl));
+            }
+        }
+    }
     public void seek() { source.seek(); }
+    public boolean prefixReady(String url) { return source.prefixReady(originalUrl(url)); }
 
     public void onSelection() {
-        suspend();
-        source.deselect();
+        cancelScheduling();
+        playingUrl = null;
+        source.transition();
         nextAllowed = 0;
     }
 
     public void suspend() {
+        cancelScheduling();
+        source.pausePrefetch();
+    }
+
+    public void stop() {
+        suspend();
+        playingUrl = null;
+        source.deselect();
+    }
+
+    private void cancelScheduling() {
         generation++;
         scheduledUrl = null;
         resolving = false;
         nextAllowed = android.os.SystemClock.elapsedRealtime() + 250;
         if (delayed != null) { main.removeCallbacks(delayed); delayed = null; }
-        source.pausePrefetch();
     }
 
     private static Object field(Object object, String name) throws Exception {

@@ -101,22 +101,24 @@ final class CommentsPanel extends FrameLayout {
         live = messages;
         this.clock = clock;
         setId(a.getResources().getIdentifier("android5_comments_panel", "id", a.getPackageName()));
-        setBackgroundColor(0x80000000);
+        setBackgroundColor(live == null ? 0x80000000 : 0x00000000);
         setFocusable(true);
         setFocusableInTouchMode(true);
         setDescendantFocusability(ViewGroup.FOCUS_BLOCK_DESCENDANTS);
-        LinearLayout box = UiTheme.page(a, live == null ? "评论" : "直播弹幕");
+        LinearLayout box = live == null ? UiTheme.page(a, "评论") : liveColumn(a);
         addView(box, new FrameLayout.LayoutParams(
-                Math.min(ModernMenuHelper.dp(a, 420),
+                live != null ? -1 : Math.min(ModernMenuHelper.dp(a, 420),
                         a.getResources().getDisplayMetrics().widthPixels * 3 / 4),
                 -1, Gravity.RIGHT));
         status = UiTheme.text(a, "", 14);
         status.setTextColor(UiTheme.MUTED);
+        if (live != null) liveText(status);
         status.setVisibility(GONE);
         box.addView(status);
         list = new ReadingList(a);
-        list.setDivider(new ColorDrawable(0x18ffffff));
-        list.setDividerHeight(ModernMenuHelper.dp(a, 1));
+        list.setDivider(new ColorDrawable(live == null ? 0x18ffffff : 0x00000000));
+        list.setDividerHeight(live == null ? ModernMenuHelper.dp(a, 1) : 0);
+        if (live != null) list.setVerticalScrollBarEnabled(false);
         list.setSelector(new ColorDrawable(0x00000000));
         list.setCacheColorHint(0x00000000);
         list.setFocusable(false);
@@ -135,7 +137,7 @@ final class CommentsPanel extends FrameLayout {
             public boolean isEnabled(int p) { return false; }
 
             public View getView(int p, View old, ViewGroup parent) {
-                CommentRow row = old instanceof CommentRow ? (CommentRow) old : new CommentRow(a);
+                CommentRow row = old instanceof CommentRow ? (CommentRow) old : new CommentRow(a, live != null);
                 Comment comment = rows.get(p);
                 row.meta.setText(live == null && comment.likes >= 0
                         ? comment.nickname + "  ·  " + comment.likes + " 赞" : comment.nickname);
@@ -161,10 +163,38 @@ final class CommentsPanel extends FrameLayout {
             return false;
         });
         box.addView(list, new LinearLayout.LayoutParams(-1, 0, 1));
-        setOnClickListener(v -> close(true));
+        if (live == null) setOnClickListener(v -> close(true));
         box.setClickable(true);
         requestFocus();
         if (live == null) load();
+    }
+
+    boolean isLive() { return live != null; }
+
+    /** Live chat occupies only the right column; it never draws a scrim over the video. */
+    FrameLayout.LayoutParams windowLayout() {
+        return new FrameLayout.LayoutParams(live == null ? -1
+                : Math.min(ModernMenuHelper.dp(activity, 360),
+                        activity.getResources().getDisplayMetrics().widthPixels * 2 / 5),
+                -1, Gravity.RIGHT);
+    }
+
+    private static void liveText(TextView text) {
+        // A small glyph shadow keeps text readable over footage without dimming the picture.
+        text.setShadowLayer(ModernMenuHelper.dp(text.getContext(), 2), 0,
+                ModernMenuHelper.dp(text.getContext(), 1), 0xe6000000);
+    }
+
+    private static LinearLayout liveColumn(Activity a) {
+        LinearLayout column = new LinearLayout(a);
+        column.setOrientation(LinearLayout.VERTICAL);
+        int padding = ModernMenuHelper.dp(a, 24);
+        column.setPadding(padding, padding, padding, padding);
+        TextView title = UiTheme.text(a, "直播弹幕", 16);
+        liveText(title);
+        title.setPadding(0, 0, 0, ModernMenuHelper.dp(a, 12));
+        column.addView(title);
+        return column;
     }
 
     /** Disabled rows must still support viewport anchoring after an eviction on a remote-only TV. */
@@ -207,20 +237,25 @@ final class CommentsPanel extends FrameLayout {
         final TextView meta, body;
         final ImageView avatar;
 
-        CommentRow(Activity a) {
+        CommentRow(Activity a, boolean live) {
             super(a);
             setOrientation(HORIZONTAL);
             setGravity(Gravity.CENTER_VERTICAL);
-            setPadding(0, ModernMenuHelper.dp(a, 14), 0, ModernMenuHelper.dp(a, 14));
+            int padding = ModernMenuHelper.dp(a, live ? 8 : 14);
+            setPadding(0, padding, 0, padding);
             setDescendantFocusability(ViewGroup.FOCUS_BLOCK_DESCENDANTS);
             setFocusable(false);
             setClickable(false);
             setLongClickable(false);
             LinearLayout words = new LinearLayout(a);
             words.setOrientation(VERTICAL);
-            meta = UiTheme.text(a, "", 10);
+            meta = UiTheme.text(a, "", live ? 12 : 10);
             meta.setTextColor(UiTheme.MUTED);
-            body = UiTheme.text(a, "", 20);
+            body = UiTheme.text(a, "", live ? 18 : 20);
+            if (live) {
+                liveText(meta);
+                liveText(body);
+            }
             body.setPadding(0, ModernMenuHelper.dp(a, 5), 0, 0);
             words.addView(meta);
             words.addView(body);
@@ -413,7 +448,8 @@ final class CommentsPanel extends FrameLayout {
     public boolean dispatchKeyEvent(KeyEvent e) {
         int key = e.getKeyCode();
         if (key == KeyEvent.KEYCODE_BACK || key == KeyEvent.KEYCODE_MENU) {
-            if (e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0) close(true);
+            if (e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0
+                    && (key == KeyEvent.KEYCODE_BACK || live == null)) close(true);
             return true;
         }
         if (key == KeyEvent.KEYCODE_DPAD_DOWN || key == KeyEvent.KEYCODE_DPAD_UP
@@ -450,7 +486,7 @@ final class CommentsPanel extends FrameLayout {
                     ? new CommentsPanel(a, LiveMessages.remote(a, InteractionController.text(item, "roomId")))
                     : new CommentsPanel(a, InteractionController.text(item, "awemeId"));
             InteractionController.field(a, "commentOverlay", panel);
-            ((ViewGroup) a.getWindow().getDecorView()).addView(panel, new ViewGroup.LayoutParams(-1, -1));
+            ((ViewGroup) a.getWindow().getDecorView()).addView(panel, panel.windowLayout());
         } catch (Exception e) {
             Toast.makeText(a, "评论暂不可用", Toast.LENGTH_SHORT).show();
         }

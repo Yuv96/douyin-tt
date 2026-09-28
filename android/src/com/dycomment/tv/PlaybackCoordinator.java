@@ -216,7 +216,7 @@ public final class PlaybackCoordinator {
         c.hideMetadata();
         if (c.deadline != null) c.main.removeCallbacks(c.deadline);
         try {
-            c.player().stopPlayback();
+            c.player().stopForSelection();
             Object item = c.current();
             c.failures.select(item, c.epoch);
             c.waiting =

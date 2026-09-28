@@ -13,7 +13,7 @@ import java.util.List;
 
 /** Followed accounts only; errors and a genuinely empty list are separate states. */
 public final class FollowedLiveActivity extends Activity {
-    android.widget.ListView list;
+    android.widget.GridView list;
     final List<SocialApi.Live> entries = new ArrayList<>();
     android.widget.BaseAdapter adapter;
     final PreviewImages images = new PreviewImages();
@@ -47,9 +47,36 @@ public final class FollowedLiveActivity extends Activity {
         status.setTextColor(UiTheme.MUTED);
         status.setPadding(dp(8), dp(14), dp(8), dp(14));
         root.addView(status);
-        list = new android.widget.ListView(this);
-        list.setDividerHeight(dp(6));
-        adapter =
+        list = createGrid(this, entries, images);
+        adapter = (android.widget.BaseAdapter) list.getAdapter();
+        list.setOnItemClickListener((parent, view, position, id) -> open(entries.get(position)));
+        root.addView(list, new LinearLayout.LayoutParams(-1, 0, 1));
+        setContentView(root);
+        refresh.requestFocus();
+        load();
+    }
+
+    static android.widget.GridView createGrid(Activity activity, List<SocialApi.Live> entries, PreviewImages images) {
+        android.widget.GridView grid = new android.widget.GridView(activity);
+        grid.setNumColumns(2);
+        grid.setColumnWidth(ModernMenuHelper.dp(activity, 280));
+        grid.setStretchMode(android.widget.GridView.STRETCH_COLUMN_WIDTH);
+        grid.setHorizontalSpacing(ModernMenuHelper.dp(activity, 12));
+        grid.setVerticalSpacing(ModernMenuHelper.dp(activity, 8));
+        grid.setBackgroundColor(UiTheme.BLACK);
+        android.graphics.drawable.GradientDrawable selector = new android.graphics.drawable.GradientDrawable();
+        selector.setColor(android.graphics.Color.TRANSPARENT);
+        selector.setCornerRadius(ModernMenuHelper.dp(activity, 10));
+        selector.setStroke(ModernMenuHelper.dp(activity, 2), UiTheme.PINK);
+        grid.setSelector(selector);
+        grid.setDrawSelectorOnTop(true);
+        grid.setRecyclerListener(view -> {
+            if (view instanceof LinearLayout) {
+                android.view.View preview = ((LinearLayout) view).getChildAt(0);
+                if (preview instanceof android.widget.ImageView) PreviewImages.release((android.widget.ImageView) preview);
+            }
+        });
+        android.widget.BaseAdapter adapter =
                 new android.widget.BaseAdapter() {
                     public int getCount() {
                         return entries.size();
@@ -68,20 +95,20 @@ public final class FollowedLiveActivity extends Activity {
                         LinearLayout row;
                         if (old instanceof LinearLayout) row = (LinearLayout) old;
                         else {
-                            row = new LinearLayout(FollowedLiveActivity.this);
+                            row = new LinearLayout(activity);
                             row.setGravity(Gravity.CENTER_VERTICAL);
-                            row.setPadding(dp(10), dp(8), dp(14), dp(8));
+                            row.setPadding(ModernMenuHelper.dp(activity, 10), ModernMenuHelper.dp(activity, 8), ModernMenuHelper.dp(activity, 14), ModernMenuHelper.dp(activity, 8));
                             row.setBackground(ModernMenuHelper.background(false));
                             android.widget.ImageView preview =
-                                    new android.widget.ImageView(FollowedLiveActivity.this);
+                                    new android.widget.ImageView(activity);
                             preview.setScaleType(android.widget.ImageView.ScaleType.CENTER_CROP);
-                            row.addView(preview, new LinearLayout.LayoutParams(dp(144), dp(81)));
-                            TextView label = new TextView(FollowedLiveActivity.this);
+                            row.addView(preview, new LinearLayout.LayoutParams(ModernMenuHelper.dp(activity, 144), ModernMenuHelper.dp(activity, 81)));
+                            TextView label = new TextView(activity);
                             label.setTextSize(22);
                             label.setTextColor(-1);
                             label.setMaxLines(2);
                             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, -2, 1);
-                            lp.leftMargin = dp(16);
+                            lp.leftMargin = ModernMenuHelper.dp(activity, 16);
                             row.addView(label, lp);
                         }
                         SocialApi.Live live = entries.get(p);
@@ -90,13 +117,8 @@ public final class FollowedLiveActivity extends Activity {
                         return row;
                     }
                 };
-        list.setAdapter(adapter);
-        list.setSelector(ModernMenuHelper.background(true));
-        list.setOnItemClickListener((parent, view, position, id) -> open(entries.get(position)));
-        root.addView(list, new LinearLayout.LayoutParams(-1, 0, 1));
-        setContentView(root);
-        refresh.requestFocus();
-        load();
+        grid.setAdapter(adapter);
+        return grid;
     }
 
     int dp(int n) {

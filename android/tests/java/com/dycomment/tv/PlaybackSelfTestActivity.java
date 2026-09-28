@@ -34,6 +34,7 @@ public final class PlaybackSelfTestActivity extends Activity {
     private volatile boolean running;
     private int outputs, stage, ticks, requestsAtSwitch;
     private int lastPosition;
+    private long switchStarted, switchFirstFrame;
 
     protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -51,7 +52,11 @@ public final class PlaybackSelfTestActivity extends Activity {
             setContentView(view);
             view.setOnInfoListener(
                     (p, what, extra) -> {
-                        if (what == 3) outputs++;
+                        if (what == 3) {
+                            outputs++;
+                            if (stage == 1 && switchFirstFrame == 0)
+                                switchFirstFrame = android.os.SystemClock.elapsedRealtime() - switchStarted;
+                        }
                         return false;
                     });
             view.setOnErrorListener(
@@ -92,6 +97,17 @@ public final class PlaybackSelfTestActivity extends Activity {
                             currentIndex = 1;
                             outputs = 0;
                             stage = 1;
+                            // An old decoder can take time to retire. The already-warm next
+                            // video must produce a frame without waiting for that teardown.
+                            try {
+                                java.util.concurrent.ThreadPoolExecutor retirement =
+                                        (java.util.concurrent.ThreadPoolExecutor) InteractionController.field(view, "retireWorker");
+                                retirement.execute(() -> {
+                                    try { Thread.sleep(1800); }
+                                    catch (InterruptedException ended) { Thread.currentThread().interrupt(); }
+                                });
+                            } catch (Exception failure) { fail("retirement fixture"); return; }
+                            switchStarted = android.os.SystemClock.elapsedRealtime();
                             view.setVideoURI(Uri.parse(feedList.get(1).videoUrl));
                         }
                     } else if (stage == 1 && outputs > 0 && position > 1800) {
@@ -99,6 +115,11 @@ public final class PlaybackSelfTestActivity extends Activity {
                             fail("cache miss: network requested again");
                             return;
                         }
+                        if (switchFirstFrame <= 0 || switchFirstFrame > 1200) {
+                            fail("warm switch delayed first frame ms=" + switchFirstFrame);
+                            return;
+                        }
+                        Log.i("Android5SelfTest", "WARM_SWITCH_FIRST_FRAME_MS=" + switchFirstFrame);
                         Log.i(
                                 "Android5SelfTest",
                                 "SECOND_VIDEO_OFFLINE_OK position="

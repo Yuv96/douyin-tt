@@ -235,9 +235,9 @@ for element in [card,row,column,column[1]]:
 card.set(a+'layout_gravity','bottom|start')
 card.set(a+'visibility','gone')
 clock=next(e for e in tree.iter() if e.get(a+'id')=='@id/tvClock')
-clock.set(a+'layout_gravity','right|top')
-clock.set(a+'layout_marginRight','16dp')
-for key in ['layout_marginStart','layout_marginEnd','layout_marginLeft']:
+clock.set(a+'layout_gravity','left|top')
+clock.set(a+'layout_marginLeft','16dp')
+for key in ['layout_marginStart','layout_marginEnd','layout_marginRight']:
     clock.attrib.pop(a+key,None)
 for key in ['paddingBottom','paddingStart','paddingEnd']: card.attrib.pop(a+key,None)
 card.set(a+'padding','0dp'); card.set(a+'layout_marginStart','18dp'); card.set(a+'layout_marginEnd','18dp'); card.set(a+'layout_marginBottom','48dp')

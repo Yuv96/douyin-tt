@@ -21,13 +21,19 @@ public final class BoundedVideoSourceTest {
     interface Case { void run() throws Exception; }
 
     public static void main(String[] args) throws Exception {
-        String[] names = {"ten-second cache and switch hit", "ten-MiB and two-entry budget",
+        String[] names = {"ten-second cache and switch hit", "ten-MiB and shared budget pressure",
+                "previous current next remain cached", "in-flight bytes are reserved",
+                "promotion preserves initialized prefetch", "promotion preserves initializing prefetch",
+                "safe cache and fallback enums",
                 "position and explicit-seek gate", "abandoned gated clients release workers",
                 "high-bitrate reachable resume gate",
                 "tail metadata before playback", "valid and malformed client ranges",
                 "cancel retains committed blocks", "superseded prefetch stays cancelled",
                 "failure has no automatic retry", "stale sockets and bounded workers"};
         Case[] cases = {BoundedVideoSourceTest::timeWindow, BoundedVideoSourceTest::byteBudget,
+                BoundedVideoSourceTest::threeWindowHistory, BoundedVideoSourceTest::inFlightBudget,
+                BoundedVideoSourceTest::promotePartial, BoundedVideoSourceTest::promoteInitializing,
+                BoundedVideoSourceTest::cacheEnums,
                 BoundedVideoSourceTest::playbackGate, BoundedVideoSourceTest::abandonedGatedClients,
                 BoundedVideoSourceTest::highBitrateGate,
                 BoundedVideoSourceTest::tailMetadata, BoundedVideoSourceTest::ranges,
@@ -80,11 +86,16 @@ public final class BoundedVideoSourceTest {
             require(env.diskBytes() + a.movie.moov.length + b.movie.moov.length <= 2 * MAX,
                     "current and next exceed total twenty-MiB budget");
             env.source.prefetch(c.url);
-            await(() -> env.source.cachedBytes(c.url) == c.movie.limit, "replacement prefix");
+            await(() -> {
+                require(env.source.budgetBytes() <= 2 * MAX, "reservation exceeded budget during eviction");
+                return env.source.cachedBytes(c.url) == c.movie.limit;
+            }, "replacement prefix");
             require(env.source.cachedBytes(b.url) == 0, "evicted next entry is retained");
+            require(env.source.prefixReady(a.url), "budget pressure evicted active window");
             require(env.fileCount() <= 2, "eviction left orphan prefix files");
             require(env.diskBytes() + a.movie.moov.length + c.movie.moov.length <= 2 * MAX,
                     "replacement exceeded total cache budget");
+            require(env.source.budgetBytes() == 2 * MAX, "settled full-window budget mismatch");
         }
     }
 
@@ -113,6 +124,150 @@ public final class BoundedVideoSourceTest {
                 equal(reply.read(16), video.movie.bytes(offset, 16), "explicit seek must release range");
             }
             require(env.source.cachedBytes(video.url) == video.movie.limit, "forwarding grew prefix cache");
+        }
+    }
+
+    private static void threeWindowHistory() throws Exception {
+        try (Environment env = new Environment()) {
+            Route a = env.origin.add("history-a", new Movie(32768, 24, 73));
+            Route b = env.origin.add("history-b", new Movie(32768, 24, 79));
+            Route c = env.origin.add("history-c", new Movie(32768, 24, 83));
+            env.source.prefetch(a.url);
+            await(() -> env.source.prefixReady(a.url), "history A ready");
+            env.source.select(a.url);
+            env.source.prefetch(b.url);
+            await(() -> env.source.prefixReady(b.url), "history B ready");
+            env.source.transition();
+            env.source.select(b.url);
+            env.source.prefetch(c.url);
+            await(() -> env.source.prefixReady(c.url), "history C ready");
+            require(env.fileCount() == 3, "small previous/current/next were evicted by entry count");
+            require(env.source.budgetBytes() < 2 * MAX, "small windows fixture must fit total budget");
+            int requests = a.requests.size() + b.requests.size() + c.requests.size();
+            for (Route selected : new Route[]{a, b, a}) {
+                env.source.transition();
+                String local = env.source.select(selected.url);
+                require(env.source.cacheMode(selected.url) == BoundedVideoSource.CacheMode.READY,
+                        "up/down/up did not retain a ready window");
+                try (Reply reply = get(local, "bytes=0-4095")) {
+                    equal(reply.read(4096), selected.movie.bytes(0, 4096), "history cache hit bytes");
+                }
+            }
+            require(requests == a.requests.size() + b.requests.size() + c.requests.size(),
+                    "up/down/up refetched origin data");
+            require(env.source.prefixReady(c.url), "next window lost during history navigation");
+            long expected = a.movie.limit + b.movie.limit + c.movie.limit
+                    + a.movie.metadataBytes + b.movie.metadataBytes + c.movie.metadataBytes;
+            require(env.source.budgetBytes() == expected, "settled three-window accounting mismatch");
+            Route d = env.origin.add("history-d", new Movie(32768, 24, 113));
+            env.source.prefetch(d.url);
+            await(() -> env.source.prefixReady(d.url), "fourth window ready");
+            require(env.source.cacheMode(c.url) == BoundedVideoSource.CacheMode.MISS,
+                    "fourth entry did not evict the least recently selected non-active window");
+            require(env.source.prefixReady(a.url) && env.source.prefixReady(b.url) && env.fileCount() == 3,
+                    "three-entry LRU evicted recent history or active data");
+        }
+    }
+
+    private static void inFlightBudget() throws Exception {
+        try (Environment env = new Environment()) {
+            Route a = env.origin.add("reserved-current", new Movie(2 * 1024 * 1024, 24, 89));
+            Route b = env.origin.add("reserved-next", new Movie(65536, 24, 97));
+            env.source.prefetch(a.url);
+            await(() -> env.source.prefixReady(a.url), "reservation current ready");
+            env.source.select(a.url);
+            b.gate = new Gate(4096 + BLOCK);
+            env.source.prefetch(b.url);
+            require(b.gate.entered.await(3, TimeUnit.SECONDS), "reservation request did not reach gate");
+            long committed = env.source.cachedBytes(b.url);
+            long expected = MAX + b.movie.metadataBytes + committed + BLOCK;
+            require(env.source.budgetBytes() == expected, "in-flight block was not reserved before origin I/O");
+            require(expected <= 2 * MAX, "reservation exceeded global budget");
+            env.source.pausePrefetch();
+            b.gate.release.countDown();
+            await(() -> env.executor("fetcher").getActiveCount() == 0, "reservation cancellation exits");
+            require(env.source.budgetBytes() == MAX + b.movie.metadataBytes + committed,
+                    "cancelled in-flight reservation was retained or committed prefix discarded");
+        }
+    }
+
+    private static void promotePartial() throws Exception {
+        try (Environment env = new Environment()) {
+            Route video = env.origin.add("promote-partial", new Movie(65536, 24, 101));
+            video.gate = new Gate(4096 + BLOCK);
+            env.source.prefetch(video.url);
+            require(video.gate.entered.await(3, TimeUnit.SECONDS), "partial promotion did not reach gate");
+            long started = System.nanoTime();
+            env.source.transition();
+            String local = env.source.select(video.url);
+            try (Reply reply = get(local, "bytes=0-4095")) {
+                equal(reply.read(4096), video.movie.bytes(0, 4096), "promoted committed prefix unavailable");
+            }
+            require(System.nanoTime() - started < TimeUnit.SECONDS.toNanos(1),
+                    "warm selection waited for background network fill");
+            require(video.gate.release.getCount() == 1, "fixture released network before cache hit");
+            require(env.source.cacheMode(video.url) == BoundedVideoSource.CacheMode.PARTIAL,
+                    "promotion invalidated partial cache");
+            video.gate.release.countDown();
+            await(() -> env.source.prefixReady(video.url), "promoted background completes");
+            long starts = video.requests.stream().filter(request -> request.first == 0).count();
+            long held = video.requests.stream().filter(request -> request.first == 4096 + BLOCK).count();
+            require(starts == 1 && held == 1, "promotion cancelled or restarted the existing range");
+            require(env.source.cacheReason(video.url) == BoundedVideoSource.CacheReason.NONE,
+                    "successful promotion retained a cancellation/failure reason");
+        }
+    }
+
+    private static void promoteInitializing() throws Exception {
+        try (Environment env = new Environment()) {
+            Route video = env.origin.add("promote-init", new Movie(32768, 24, 103));
+            video.gate = new Gate(0);
+            env.source.prefetch(video.url);
+            require(video.gate.entered.await(3, TimeUnit.SECONDS), "initializing promotion did not reach gate");
+            long started = System.nanoTime();
+            env.source.transition();
+            String local = env.source.select(video.url);
+            require(System.nanoTime() - started < TimeUnit.SECONDS.toNanos(1),
+                    "selection waited for an initialization network lock");
+            require(env.source.cacheMode(video.url) == BoundedVideoSource.CacheMode.INITIALIZING,
+                    "initializing promotion falsely marked failed");
+            video.gate.release.countDown();
+            await(() -> env.source.prefixReady(video.url), "promoted initialization finishes");
+            require(video.requests.stream().filter(request -> request.first == 0).count() == 1,
+                    "initializing promotion refetched the header");
+            try (Reply reply = get(local, "bytes=0-31")) {
+                equal(reply.read(32), video.movie.bytes(0, 32), "promoted initialization bytes");
+            }
+        }
+    }
+
+    private static void cacheEnums() throws Exception {
+        try (Environment env = new Environment()) {
+            require(env.source.cacheMode(null) == BoundedVideoSource.CacheMode.MISS, "missing mode enum");
+            require(env.source.cacheReason(null) == BoundedVideoSource.CacheReason.NONE, "missing reason enum");
+            Route nativeSource = env.origin.add("native-range", new Movie(32768, 24, 107));
+            nativeSource.noRanges = true;
+            env.source.prefetch(nativeSource.url);
+            await(() -> env.source.cacheMode(nativeSource.url) == BoundedVideoSource.CacheMode.DIRECT,
+                    "native source fallback mode");
+            require(env.source.cacheReason(nativeSource.url) == BoundedVideoSource.CacheReason.ORIGIN_NO_RANGE,
+                    "HTTP 200 range fallback reason");
+            Movie unsupported = new Movie(32768, 24, 109);
+            for (int at = 0; at < unsupported.head.length - 20; at++) {
+                if (unsupported.head[at] == 's' && unsupported.head[at + 1] == 't'
+                        && unsupported.head[at + 2] == 't' && unsupported.head[at + 3] == 's') {
+                    Arrays.fill(unsupported.head, at + 16, at + 20, (byte) 0); // Invalid sample duration.
+                    break;
+                }
+            }
+            Route index = env.origin.add("unsupported-index", unsupported);
+            env.source.prefetch(index.url);
+            await(() -> env.source.cacheMode(index.url) == BoundedVideoSource.CacheMode.DIRECT,
+                    "unsupported index fallback mode");
+            require(env.source.cacheReason(index.url) == BoundedVideoSource.CacheReason.INDEX_UNSUPPORTED,
+                    "unsupported index fallback reason");
+            await(() -> env.executor("fetcher").getActiveCount() == 0, "direct reservation cleanup");
+            require(env.source.budgetBytes() == 0, "direct fallback leaked byte reservations");
         }
     }
 
@@ -454,6 +609,7 @@ public final class BoundedVideoSourceTest {
             try {
                 for (String name : new String[]{"fetcher", "clients", "canceller"})
                     require(pool(name).awaitTermination(7, TimeUnit.SECONDS), "source worker survived close: " + name);
+                require(source.budgetBytes() == 0, "closed source retained cache or in-flight reservations");
             } finally {
                 origin.close();
                 try (DirectoryStream<Path> files = Files.newDirectoryStream(directory)) {

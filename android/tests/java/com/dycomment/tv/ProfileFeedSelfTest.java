@@ -7,6 +7,10 @@ import android.widget.GridView;
 import android.view.ViewGroup;
 import android.view.KeyEvent;
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Rect;
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.BitmapDrawable;
 import org.json.JSONObject;
 
@@ -91,7 +95,11 @@ final class ProfileFeedSelfTest {
                     if (stage == 0) {
                         geometry(activity);
                         grid.requestFocusFromTouch(); grid.setSelection(0);
-                    } else if (stage == 1) key(grid, KeyEvent.KEYCODE_DPAD_RIGHT);
+                    } else if (stage == 1) {
+                        require(grid.hasFocus() && grid.isFocusable(), "grid retains real keyboard focus for the remote");
+                        singleFocus(grid);
+                        key(grid, KeyEvent.KEYCODE_DPAD_RIGHT);
+                    }
                     else if (stage == 2) {
                         require(grid.getSelectedItemPosition() == 1, "remote right advances one item");
                         key(grid, KeyEvent.KEYCODE_DPAD_DOWN);
@@ -126,6 +134,7 @@ final class ProfileFeedSelfTest {
                     } else {
                         geometry(activity);
                         if (previousFocus != null) previousFocus.requestFocus();
+                        singleFocus(ProfileGrid.view(activity));
                         android.util.Log.i("Android5LegacyUiTest", "PROFILE_WINDOW_BITMAP_DPAD_OK");
                         passed.run();
                         return;
@@ -143,5 +152,30 @@ final class ProfileFeedSelfTest {
     private static void key(GridView grid, int code) {
         grid.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, code));
         grid.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_UP, code));
+    }
+
+    private static void singleFocus(GridView grid) {
+        require(grid != null && grid.getBackground() != null && grid.getSelector() != null,
+                "grid and item selector remain available");
+        require(pixel(grid.getBackground(), 0, 32) == UiTheme.BLACK
+                        && pixel(grid.getBackground(), 32, 32) == UiTheme.BLACK,
+                "focused viewport has no outer focus border or control fill");
+        require(pixel(grid.getSelector(), 0, 32) == UiTheme.PINK
+                        && Color.alpha(pixel(grid.getSelector(), 32, 32)) == 0,
+                "the item selector retains the single pink outline without obscuring its cover");
+        android.util.Log.i("Android5LegacyUiTest", "PROFILE_SINGLE_ITEM_FOCUS_OK");
+    }
+
+    private static int pixel(Drawable drawable, int x, int y) {
+        Rect bounds = new Rect(drawable.getBounds());
+        Bitmap bitmap = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888);
+        try {
+            drawable.setBounds(0, 0, 64, 64);
+            drawable.draw(new Canvas(bitmap));
+            return bitmap.getPixel(x, y);
+        } finally {
+            drawable.setBounds(bounds);
+            bitmap.recycle();
+        }
     }
 }

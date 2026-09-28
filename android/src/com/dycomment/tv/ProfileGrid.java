@@ -22,6 +22,7 @@ import java.util.List;
 public final class ProfileGrid {
     static final int COLUMNS = 6, PAGE = 18;
     private static final int TAG = 0x7f0f7a64;
+    private static final int ITEM_FOCUS = 0x7f0f7a66;
     private final Activity activity;
     private final ScrollView original;
     private final LinearLayout container, host;
@@ -52,6 +53,7 @@ public final class ProfileGrid {
         host = new LinearLayout(activity);
         host.setOrientation(LinearLayout.VERTICAL);
         grid = new GridView(activity);
+        grid.setTag(ITEM_FOCUS, Boolean.TRUE);
         grid.setNumColumns(COLUMNS);
         grid.setStretchMode(GridView.NO_STRETCH);
         grid.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -126,6 +128,10 @@ public final class ProfileGrid {
     static GridView view(Activity activity) {
         Object value = activity.getWindow().getDecorView().getTag(TAG);
         return value instanceof ProfileGrid ? ((ProfileGrid) value).grid : null;
+    }
+
+    static boolean usesItemFocus(View view) {
+        return view instanceof GridView && Boolean.TRUE.equals(view.getTag(ITEM_FOCUS));
     }
 
     static void more(Activity activity) {

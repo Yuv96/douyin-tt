@@ -358,6 +358,12 @@ public final class LegacyTheme {
     }
 
     static void control(View view) {
+        if (ProfileGrid.usesItemFocus(view)) {
+            // GridView must own keyboard focus for DPAD, but its selector already outlines the item.
+            // A second control border here would outline the entire viewport at the same time.
+            view.setBackgroundColor(UiTheme.BLACK);
+            return;
+        }
         GradientDrawable background = view.getBackground() instanceof GradientDrawable
                 ? (GradientDrawable) view.getBackground() : new GradientDrawable();
         owners.put(background, new WeakReference<>(view));
