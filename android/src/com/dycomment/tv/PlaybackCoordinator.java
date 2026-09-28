@@ -15,11 +15,57 @@ public final class PlaybackCoordinator {
     private static final int TAG = 0x7f0f7a52;
     private final Activity activity;
     private final Handler main = new Handler(Looper.getMainLooper());
-    private int epoch;
+    private volatile int epoch;
     private boolean waiting, failed;
+    private boolean transitioning;
+    private final FailureBudget failures = new FailureBudget();
     private Runnable deadline;
     private final InfoCardState info = new InfoCardState();
     private final Runnable hideInfo = () -> renderMetadata();
+
+    /** One consumed error per attempt; selecting the same object preserves its retry budget. */
+    static final class FailureBudget {
+        static final int IGNORE = 0, RETRY = 1, REMOVE = 2;
+        Object item;
+        int token, count;
+        boolean consumed;
+        private int detailToken = -1;
+        private boolean detailDone;
+
+        void select(Object selected, int epoch) {
+            if (item != selected) { item = selected; count = 0; }
+            token = epoch;
+            consumed = false;
+            detailToken = -1;
+            detailDone = false;
+        }
+
+        int error(int epoch) {
+            if (item == null || token != epoch || consumed) return IGNORE;
+            consumed = true;
+            count = Math.min(2, count + 1);
+            return count == 1 ? RETRY : REMOVE;
+        }
+
+        boolean beginDetail(int epoch) {
+            if (item == null || token != epoch || consumed || detailToken == epoch) return false;
+            detailToken = epoch;
+            return true;
+        }
+
+        boolean detailResult(int epoch) {
+            if (token != epoch || detailToken != epoch || consumed || detailDone) return false;
+            detailDone = true;
+            return true;
+        }
+    }
+
+    /** Remove only the selected identity. A missing successor never wraps to earlier entries. */
+    static int removeFailed(List<?> feed, int index, Object item) {
+        if (index < 0 || index >= feed.size() || feed.get(index) != item) return -1;
+        feed.remove(index);
+        return index < feed.size() ? index : -1;
+    }
 
     private void cancelLegacyInfoTimer() {
         try {
@@ -132,6 +178,8 @@ public final class PlaybackCoordinator {
             PlaybackCoordinator c = (PlaybackCoordinator) value;
             c.epoch++;
             c.waiting = false;
+            c.transitioning = false;
+            c.failures.select(null, c.epoch);
             c.main.removeCallbacksAndMessages(null);
             c.deadline = null;
             a.getWindow().getDecorView().setTag(TAG, null);
@@ -143,10 +191,13 @@ public final class PlaybackCoordinator {
     }
 
     public static boolean valid(Activity a, int token) {
-        return !a.isFinishing() && !a.isDestroyed() && get(a).epoch == token;
+        if (a.isFinishing() || a.isDestroyed()) return false;
+        Object value = a.getWindow().getDecorView().getTag(TAG);
+        return value instanceof PlaybackCoordinator && ((PlaybackCoordinator) value).epoch == token;
     }
 
     public static void selected(Activity a) {
+        if (a.isFinishing() || a.isDestroyed()) return;
         LiveChatController.stop(a);
         try {
             Object comments = InteractionController.field(a, "commentOverlay");
@@ -154,6 +205,8 @@ public final class PlaybackCoordinator {
         } catch (Exception ignored) { }
         PlaybackCoordinator c = get(a);
         c.epoch++;
+        c.transitioning = false;
+        c.waiting = false;
         c.failed = false;
         c.info.selected();
         if (ModernMenuHelper.recallsMetadata(a)) c.info.menu(true);
@@ -165,6 +218,7 @@ public final class PlaybackCoordinator {
         try {
             c.player().stopPlayback();
             Object item = c.current();
+            c.failures.select(item, c.epoch);
             c.waiting =
                     item != null
                             && ((List<?>) InteractionController.field(item, "imageUrls")).isEmpty();
@@ -174,11 +228,12 @@ public final class PlaybackCoordinator {
                 final int token = c.epoch;
                 c.deadline =
                         () -> {
-                            if (valid(a, token) && c.waiting) error(a);
+                            if (valid(a, token) && c.waiting) error(a, token);
                         };
                 c.main.postDelayed(c.deadline, 22000);
             }
         } catch (Exception ignored) {
+            c.failures.select(null, c.epoch);
         }
     }
 
@@ -197,8 +252,11 @@ public final class PlaybackCoordinator {
 
     public static void loading(Context context) {
         Activity a = host(context);
-        if (a == null) return;
-        PlaybackCoordinator c = get(a);
+        if (a == null || a.isFinishing() || a.isDestroyed()) return;
+        Object value = a.getWindow().getDecorView().getTag(TAG);
+        if (!(value instanceof PlaybackCoordinator)) return;
+        PlaybackCoordinator c = (PlaybackCoordinator) value;
+        if (c.transitioning || c.failures.item == null) return;
         c.waiting = true;
         c.failed = false;
         c.hideMetadata();
@@ -207,8 +265,11 @@ public final class PlaybackCoordinator {
 
     public static void ready(Context context) {
         Activity a = host(context);
-        if (a == null) return;
-        PlaybackCoordinator c = get(a);
+        if (a == null || a.isFinishing() || a.isDestroyed()) return;
+        Object value = a.getWindow().getDecorView().getTag(TAG);
+        if (!(value instanceof PlaybackCoordinator)) return;
+        PlaybackCoordinator c = (PlaybackCoordinator) value;
+        if (c.transitioning || c.failures.item == null) return;
         c.waiting = false;
         c.failed = false;
         if (c.deadline != null) c.main.removeCallbacks(c.deadline);
@@ -222,11 +283,31 @@ public final class PlaybackCoordinator {
     }
 
     public static boolean error(Activity a) {
+        Object value = a.getWindow().getDecorView().getTag(TAG);
+        return !(value instanceof PlaybackCoordinator) || error(a, ((PlaybackCoordinator) value).epoch);
+    }
+
+    public static boolean error(Activity a, int token) {
+        if (!valid(a, token)) return true;
         PlaybackCoordinator c = get(a);
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            c.main.post(() -> error(a, token));
+            return true;
+        }
+        if (c.transitioning) return true;
+        final Object item = c.failures.item;
+        try { if (c.current() != item) return true; }
+        catch (Exception unavailable) { return true; }
+        final int action = c.failures.error(token);
+        if (action == FailureBudget.IGNORE) return true;
         c.epoch++;
         c.waiting = false;
-        c.failed = true;
+        c.failed = false;
+        c.transitioning = true;
         if (c.deadline != null) c.main.removeCallbacks(c.deadline);
+        c.deadline = null;
+        c.main.removeCallbacks(c.hideInfo);
+        c.info.selected();
         try {
             c.player().stopPlayback();
             c.call("stopDanmakuScheduler");
@@ -234,38 +315,47 @@ public final class PlaybackCoordinator {
         } catch (Exception ignored) {
         }
         c.hideMetadata();
-        c.message("加载失败或超时：上/下键切换，确定键重试");
+        try { c.call("hideLoading"); } catch (Exception ignored) { }
+        final int transition = c.epoch;
+        c.main.post(() -> {
+            if (!valid(a, transition) || !c.transitioning) return;
+            try {
+                if (c.current() != item) { c.transitioning = false; return; }
+                int index = (Integer) InteractionController.field(a, "currentIndex");
+                c.transitioning = false;
+                if (action == FailureBudget.RETRY) {
+                    // playAt's selected hook will advance the epoch while retaining this object's budget.
+                    // Reuse its existing URL; an empty URL takes the normal single detail-request path.
+                    c.failures.select(item, c.epoch);
+                    InteractionController.call(a, "playAt", new Class<?>[] {int.class}, index);
+                } else {
+                    List<?> feed = (List<?>) InteractionController.field(a, "feedList");
+                    int next = removeFailed(feed, index, item);
+                    c.failures.select(null, c.epoch);
+                    InteractionController.field(a, "currentIndex", next >= 0 ? next : feed.isEmpty() ? -1 : feed.size() - 1);
+                    if (next >= 0) {
+                        c.failures.select(feed.get(next), c.epoch);
+                        InteractionController.call(a, "playAt", new Class<?>[] {int.class}, next);
+                    }
+                }
+            } catch (Exception unavailable) {
+                c.transitioning = false;
+                // A failed retry launch consumes the final attempt; never add a separate refresh loop.
+                error(a, c.epoch);
+            }
+        });
         return true;
     }
 
     public static boolean retryKey(Activity a, KeyEvent e) {
-        if (!get(a).failed || ModernMenuHelper.isMenuShowing()) return false;
-        try {
-            if ((Boolean) InteractionController.field(a, "menuShowing")) return false;
-        } catch (Exception ignored) {
-        }
-        if (e.getKeyCode() != KeyEvent.KEYCODE_DPAD_CENTER
-                && e.getKeyCode() != KeyEvent.KEYCODE_ENTER) return false;
-        if (e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0) {
-            try {
-                int index = (Integer) InteractionController.field(a, "currentIndex");
-                Object item = get(a).current();
-                if (item != null && !((Boolean) InteractionController.field(item, "isLive")))
-                    InteractionController.field(
-                            item, "videoUrl", ""); // refresh expired CDN URL on explicit retry
-                InteractionController.call(a, "playAt", new Class<?>[] {int.class}, index);
-            } catch (Exception ex) {
-                error(a);
-            }
-        }
-        return true;
+        return false;
     }
 
     public static void detail(Activity a, Object item) {
         final PlaybackCoordinator c = get(a);
         final int token = c.epoch;
         try {
-            if (c.current() != item) return;
+            if (c.current() != item || c.transitioning || !c.failures.beginDetail(token)) return;
             Class<?> callback = Class.forName("com.dycomment.tv.DouyinApi$DetailCallback");
             Object listener =
                     Proxy.newProxyInstance(
@@ -278,11 +368,12 @@ public final class PlaybackCoordinator {
                                             () -> {
                                                 if (!valid(a, token)) return;
                                                 try {
-                                                    if (c.current() != item) return;
+                                                    if (c.current() != item || !c.failures.detailResult(token)) return;
                                                     if (!method.getName().equals("onResult")
                                                             || args == null
+                                                            || args.length == 0
                                                             || args[0] == null) {
-                                                        error(a);
+                                                        error(a, token);
                                                         return;
                                                     }
                                                     Object result = args[0];
@@ -290,7 +381,7 @@ public final class PlaybackCoordinator {
                                                             InteractionController.text(
                                                                     result, "videoUrl");
                                                     if (url.isEmpty()) {
-                                                        error(a);
+                                                        error(a, token);
                                                         return;
                                                     }
                                                     InteractionController.field(
@@ -306,7 +397,7 @@ public final class PlaybackCoordinator {
                                                             new Class<?>[] {String.class},
                                                             url);
                                                 } catch (Exception e) {
-                                                    error(a);
+                                                    error(a, token);
                                                 }
                                             });
                                 return null;
@@ -315,7 +406,7 @@ public final class PlaybackCoordinator {
                     .getMethod("getVideoDetail", String.class, callback)
                     .invoke(null, InteractionController.text(item, "awemeId"), listener);
         } catch (Exception e) {
-            error(a);
+            error(a, token);
         }
     }
 }

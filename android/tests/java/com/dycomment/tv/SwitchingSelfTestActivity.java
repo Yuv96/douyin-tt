@@ -43,7 +43,7 @@ public final class SwitchingSelfTestActivity extends Activity
                     .putBoolean("auto_play_next", false)
                     .putString("overlay_mode", "permanent")
                     .apply();
-            File[] cached = new File(getCacheDir(), "next-video-v1").listFiles();
+            File[] cached = new File(getCacheDir(), "video-prefix-v2").listFiles();
             if (cached != null) for (File f : cached) f.delete();
             server = new ServerSocket(0, 20, InetAddress.getByName("127.0.0.1"));
             running = true;
@@ -149,7 +149,7 @@ public final class SwitchingSelfTestActivity extends Activity
                             stageAt = now;
                             Log.i(
                                     "Android5SwitchTest",
-                                    "OVERSIZE_PREFETCH_SKIPPED_AND_LOADING_UI_OK");
+                                    "BOUNDED_PREFETCH_AND_LOADING_UI_OK");
                         } else if (stage == 1 && now - stageAt > 220) {
                             // Repeated down/up while a 512 MiB response never delivers a frame.
                             key(
@@ -212,16 +212,18 @@ public final class SwitchingSelfTestActivity extends Activity
                             checkLoading();
                             stage = 4;
                             stageAt = now;
-                        } else if (stage == 4 && now - stageAt > 24000) {
-                            if (!((android.widget.TextView) field("tvLoading"))
-                                    .getText()
-                                    .toString()
-                                    .contains("确定键重试"))
-                                throw new Exception(
-                                        "stalled startup did not reach recoverable timeout");
-                            checkLoading();
+                        } else if (stage == 4 && now - stageAt > 9000) {
+                            String loading = ((android.widget.TextView) field("tvLoading")).getText().toString();
+                            if (loading.contains("失败") || loading.contains("重试"))
+                                throw new Exception("failed video exposed an error UI");
+                            // The stalled item must be retried only once, then removed. Subsequent
+                            // stalled items may already be processing; return to the surviving first.
+                            if (((List<?>) field("feedList")).size() >= 20) {
+                                handler.postDelayed(this, 100);
+                                return;
+                            }
                             outputs = 0;
-                            key(KeyEvent.KEYCODE_DPAD_UP);
+                            InteractionController.call(feed, "playAt", new Class<?>[] {int.class}, 0);
                             stage = 5;
                             stageAt = now;
                         } else if (stage == 5
@@ -239,15 +241,15 @@ public final class SwitchingSelfTestActivity extends Activity
                                     android.os.Debug.getNativeHeapAllocatedSize() - heapBefore;
                             if (growth > 64L * 1024 * 1024)
                                 throw new Exception("native heap grew " + growth);
-                            File[] files = new File(getCacheDir(), "next-video-v1").listFiles();
+                            File[] files = new File(getCacheDir(), "video-prefix-v2").listFiles();
                             long total = 0;
                             if (files != null)
                                 for (File f : files) {
                                     total += f.length();
-                                    if (f.length() > 32L * 1024 * 1024)
+                                    if (f.length() > 10L * 1024 * 1024)
                                         throw new Exception("oversized cache entry");
                                 }
-                            if (total > 64L * 1024 * 1024)
+                            if (total > 20L * 1024 * 1024)
                                 throw new Exception("cache budget exceeded");
                             Log.i(
                                     "Android5SwitchTest",

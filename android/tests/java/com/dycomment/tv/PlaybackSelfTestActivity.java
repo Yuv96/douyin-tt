@@ -38,7 +38,7 @@ public final class PlaybackSelfTestActivity extends Activity {
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         try {
-            File cache = new File(getCacheDir(), "next-video-v1");
+            File cache = new File(getCacheDir(), "video-prefix-v2");
             File[] files = cache.listFiles();
             if (files != null) for (File f : files) f.delete();
             server = new ServerSocket(0, 10, InetAddress.getByName("127.0.0.1"));
@@ -76,10 +76,13 @@ public final class PlaybackSelfTestActivity extends Activity {
                     }
                     int position = view.getCurrentPosition();
                     if (stage == 0 && outputs > 0 && position > 2500) {
-                        File[] f =
-                                new File(getCacheDir(), "next-video-v1")
-                                        .listFiles((d, n) -> n.endsWith(".mp4"));
-                        if (f != null && f.length > 0) {
+                        boolean ready = false;
+                        try {
+                            Object cache = InteractionController.field(view, "cache");
+                            BoundedVideoSource source = (BoundedVideoSource) InteractionController.field(cache, "source");
+                            ready = source.prefixReady(feedList.get(1).videoUrl);
+                        } catch (Exception ignored) { }
+                        if (ready) {
                             Log.i("Android5SelfTest", "FIRST_VIDEO_OK position=" + position);
                             requestsAtSwitch = secondRequests.get();
                             if (requestsAtSwitch < 1) {

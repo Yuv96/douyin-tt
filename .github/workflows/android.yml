@@ -20,8 +20,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
       - name: Check source, synthetic packaging fixtures and signing guards without compiling an APK
         run: python3 -B -m unittest discover -s android/tests -p 'test_*.py' -v
+      - name: Verify bounded video ranges, playback gating and MP4 sample windows
+        run: |
+          mkdir -p "$RUNNER_TEMP/video-tests"
+          javac -encoding UTF-8 -d "$RUNNER_TEMP/video-tests" android/src/com/dycomment/tv/Mp4Window.java android/src/com/dycomment/tv/BoundedVideoSource.java android/tests/jvm/com/dycomment/tv/*.java
+          java -cp "$RUNNER_TEMP/video-tests" com.dycomment.tv.Mp4WindowTest
+          java -cp "$RUNNER_TEMP/video-tests" com.dycomment.tv.BoundedVideoSourceTest
   build-test:
     if: inputs.build_apk == true
     needs: source-checks

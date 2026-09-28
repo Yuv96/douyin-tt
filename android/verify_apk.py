@@ -23,7 +23,7 @@ with zipfile.ZipFile(apk) as z:
     assert b'SelfTestActivity' not in dex
     assert b'TEST_PAIR_CONFIRM' not in dex, 'Test-only pairing approval hook in production'
     assert b'TEST_BROWSER_ACTION' not in dex, 'Test-only browser action trigger in production'
-    for fixture in (b'BrowserActionsSelfTest', b'ProfileFeedSelfTest', b'QuickShareSelfTest', b'WireFixture'):
+    for fixture in (b'BrowserActionsSelfTest', b'ProfileFeedSelfTest', b'QuickShareSelfTest', b'WireFixture', b'PlaybackFailureSelfTest'):
         assert fixture not in dex, 'Test fixture in production'
     assert b'LanPairingSelfTest' not in dex, 'Pairing fixture in production'
     assert b'LanPairingConfirmationReceiver' not in dex and 'LanPairingConfirmationReceiver' not in manifest, 'Test pairing receiver in production'

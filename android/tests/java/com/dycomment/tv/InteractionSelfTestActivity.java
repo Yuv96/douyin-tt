@@ -26,6 +26,7 @@ public final class InteractionSelfTestActivity extends Activity {
         setContentView(result);
         try {
             LegacyThemeSelfTest.run(this);
+            PlaybackFailureSelfTest.run();
             require(
                     CredentialStore.value("a=1; msToken=x=y; sessionid=s", "msToken").equals("x=y"),
                     "Cookie token preserves equals");

@@ -16,7 +16,6 @@ import org.videolan.libvlc.LibVLC;
 import org.videolan.libvlc.Media;
 import org.videolan.libvlc.interfaces.IVLCVout;
 
-import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Map;
@@ -163,10 +162,7 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
         final int token = generation;
         try {
             String original = NextVideoCache.originalUrl(uri.toString());
-            File cached = cache.lookup(original);
-            // LibVLC supports the CDN stream itself. Do not leave the legacy proxy's
-            // unbounded worker pool reading abandoned responses for another 60 seconds.
-            Uri source = cached == null ? Uri.parse(original) : Uri.fromFile(cached);
+            Uri source = Uri.parse(cache.playbackUrl(getContext(), original));
             player = new org.videolan.libvlc.MediaPlayer(engine());
             attachVideo();
             player.setEventListener(
@@ -183,7 +179,7 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
             media.release();
             setKeepScreenOn(true);
             player.play();
-            Log.i("Android5Player", "OPEN decoder=software cache=" + (cached != null));
+            Log.i("Android5Player", "OPEN decoder=software");
         } catch (Exception | LinkageError e) {
             Log.e("Android5Player", "OPEN_FAILED " + e.getClass().getSimpleName());
             failPlayback("OPEN_FAILED");
@@ -227,6 +223,9 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
                     Log.i("Android5Player", "VIDEO_OUTPUT count=" + e.getVoutCount());
                     if (onInfo != null) onInfo.onInfo(null, 3, 0);
                 }
+                break;
+            case org.videolan.libvlc.MediaPlayer.Event.TimeChanged:
+                if (wantPlay && videoOutput) cache.position(e.getTimeChanged());
                 break;
             case org.videolan.libvlc.MediaPlayer.Event.Buffering:
                 buffer = Math.round(e.getBuffering());
@@ -344,7 +343,10 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
     }
 
     public void seekTo(int ms) {
-        if (player != null && prepared) player.setTime(Math.max(0, ms));
+        if (player != null && prepared) {
+            cache.seek();
+            player.setTime(Math.max(0, ms));
+        }
     }
 
     public int getCurrentPosition() {
