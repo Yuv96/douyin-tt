@@ -61,6 +61,7 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
     private boolean voutReady;
     private int frameGeneration;
     private long displayedBaseline;
+    private long frameDiagnosticAt;
     private SurfaceView frameSurface;
     private Media frameMedia;
     private org.videolan.libvlc.MediaPlayer framePlayer;
@@ -72,6 +73,15 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
             // Audio output may be allocated after play(), so enforce silence until a frame exists.
             player.setVolume(0);
             org.videolan.libvlc.interfaces.IMedia.Stats stats = displayedMedia.getStats();
+            long now = SystemClock.elapsedRealtime();
+            if (now - frameDiagnosticAt >= 1000) {
+                frameDiagnosticAt = now;
+                Log.i("Android5Player", "FRAME_WAIT baseline=" + displayedBaseline
+                        + " displayed=" + (stats == null ? -1 : stats.displayedPictures)
+                        + " decoded=" + (stats == null ? -1 : stats.decodedVideo)
+                        + " position=" + player.getTime() + " playing=" + player.isPlaying()
+                        + " vout=" + voutReady);
+            }
             if (voutReady && stats != null && stats.displayedPictures > displayedBaseline
                     && surface.getHolder().getSurface().isValid()) {
                 presentFrame();
@@ -330,6 +340,7 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
         framePlayer = player;
         org.videolan.libvlc.interfaces.IMedia.Stats stats = displayedMedia.getStats();
         displayedBaseline = stats == null ? 0 : stats.displayedPictures;
+        frameDiagnosticAt = SystemClock.elapsedRealtime();
         player.setVolume(0);
         main.post(frameProbe);
     }
