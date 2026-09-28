@@ -1,7 +1,7 @@
 # 开发约束
 
 - 本地仅进行源码编辑、获授权的接口联调和 Git 操作；禁止本地编译、构建、单元测试、回归测试、模拟器测试及测试性质的检查命令。
-- 所有编译和测试通过 GitHub Actions 手动执行。默认只检查，显式选择 `build_apk` 才编译并生成 Actions 产物，不发布 Release。
+- 所有编译和测试通过 GitHub Actions 手动执行。默认只检查，显式选择 `build_apk` 才编译。
 - 接口联调使用 agent-webview；Python 使用 `-B` 或 `PYTHONDONTWRITEBYTECODE=1`。
 - 凭证、控制器 Token、账号标识和原始响应仅存入忽略目录 `.local-debug/`，文件权限为 0600；不提交、不上传 CI、不打印到终端。
 - 不将个人 IP、网络配置、设备信息或本机绝对路径写入仓库。
