@@ -270,6 +270,9 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
                     if (surfaceResumePosition >= 0 && player != null) {
                         long position = surfaceResumePosition;
                         surfaceResumePosition = -1;
+                        // Restoring a destroyed surface seeks the demuxer too. Its read-ahead
+                        // must not wait for the five-second clock that this seek has stopped.
+                        cache.seek();
                         player.setTime(position, false);
                         org.videolan.libvlc.interfaces.IMedia.Stats stats = displayedMedia.getStats();
                         displayedBaseline = stats == null ? 0 : stats.displayedPictures;
