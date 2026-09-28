@@ -49,7 +49,7 @@ final class PreviewImages {
         request.executor = work;
         view.setTag(REQUEST, request);
         view.setTag(url);
-        view.setImageBitmap(null);
+        view.setImageDrawable(null);
         view.setBackgroundColor(0x26ffffff);
         if (url == null || url.isEmpty()) return;
         int width = 320, height = 180;
