@@ -225,7 +225,7 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
                 }
                 break;
             case org.videolan.libvlc.MediaPlayer.Event.TimeChanged:
-                if (wantPlay && videoOutput) cache.position(e.getTimeChanged());
+                if (wantPlay) cache.position(e.getTimeChanged());
                 break;
             case org.videolan.libvlc.MediaPlayer.Event.Buffering:
                 buffer = Math.round(e.getBuffering());
@@ -297,8 +297,10 @@ public class PlayerView extends FrameLayout implements IVLCVout.OnNewVideoLayout
         IVLCVout vout = player.getVLCVout();
         if (!vout.areViewsAttached()) {
             final int token = generation;
-            if (prepared && player.isSeekable())
+            if (prepared && player.isSeekable()) {
                 surfaceResumePosition = Math.max(0, player.getTime());
+                cache.position(surfaceResumePosition);
+            }
             videoOutput = false;
             stalledAt = 0;
             openedAt = SystemClock.elapsedRealtime();

@@ -270,7 +270,16 @@ final class BoundedVideoSource implements Closeable {
                     }
                     out.write(block, 0, n);
                 } else {
-                    while (!e.unlocked && e.resumeAfterMs > 0 && current(e, token)) Thread.sleep(50);
+                    // VLC closes abandoned requests when seeking or rebuilding a surface.
+                    // Observe that FIN while gated, otherwise two obsolete readers can occupy
+                    // both workers and prevent the new cached-range request from starting.
+                    client.setSoTimeout(100);
+                    while (!e.unlocked && e.resumeAfterMs > 0 && current(e, token)) {
+                        try {
+                            if (in.read() < 0) return;
+                            throw new IOException("unexpected pipelined request");
+                        } catch (SocketTimeoutException waitingForPlayback) { }
+                    }
                     if (!current(e, token)) break;
                     e.forward(start, end, out, token);
                     return;
@@ -278,7 +287,7 @@ final class BoundedVideoSource implements Closeable {
                 start += n;
                 out.flush();
             }
-        } catch (IOException | InterruptedException | RuntimeException ignored) {
+        } catch (IOException | RuntimeException ignored) {
             // A disconnected range produces a native player error. No recursive retry here.
         } finally { requestEpoch.remove(); sockets.remove(socket); }
     }

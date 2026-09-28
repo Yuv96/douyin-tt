@@ -3,8 +3,8 @@ package com.dycomment.tv;
 import android.content.Context;
 
 /**
- * Binary compatibility only: LibVLC reads the origin directly, so no local server or thread pool is
- * needed.
+ * Legacy binary compatibility only. PlayerView owns the bounded range source;
+ * the former proxy is never started by the original UI.
  */
 public final class VideoProxyServer {
     public void start(Context context) {}

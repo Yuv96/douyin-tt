@@ -105,6 +105,21 @@ public final class PlaybackSelfTestActivity extends Activity {
                                         + position
                                         + " requests="
                                         + secondRequests.get());
+                        stage = 7;
+                    } else if (stage == 7) {
+                        if (position < 4500 && secondRequests.get() != requestsAtSwitch) {
+                            fail("origin resumed before playback interest threshold");
+                            return;
+                        }
+                        if (position < 11000) {
+                            handler.postDelayed(this, 500);
+                            return;
+                        }
+                        if (secondRequests.get() <= requestsAtSwitch) {
+                            fail("playback did not fetch beyond the cached ten-second prefix");
+                            return;
+                        }
+                        Log.i("Android5SelfTest", "FIVE_SECOND_GATE_AND_CONTINUATION_OK position=" + position);
                         view.pause();
                         lastPosition = position;
                         stage = 2;

@@ -22,12 +22,14 @@ public final class BoundedVideoSourceTest {
 
     public static void main(String[] args) throws Exception {
         String[] names = {"ten-second cache and switch hit", "ten-MiB and two-entry budget",
-                "position and explicit-seek gate", "high-bitrate reachable resume gate",
+                "position and explicit-seek gate", "abandoned gated clients release workers",
+                "high-bitrate reachable resume gate",
                 "tail metadata before playback", "valid and malformed client ranges",
                 "cancel retains committed blocks", "superseded prefetch stays cancelled",
                 "failure has no automatic retry", "stale sockets and bounded workers"};
         Case[] cases = {BoundedVideoSourceTest::timeWindow, BoundedVideoSourceTest::byteBudget,
-                BoundedVideoSourceTest::playbackGate, BoundedVideoSourceTest::highBitrateGate,
+                BoundedVideoSourceTest::playbackGate, BoundedVideoSourceTest::abandonedGatedClients,
+                BoundedVideoSourceTest::highBitrateGate,
                 BoundedVideoSourceTest::tailMetadata, BoundedVideoSourceTest::ranges,
                 BoundedVideoSourceTest::partialCancellation, BoundedVideoSourceTest::supersededPrefetch,
                 BoundedVideoSourceTest::noRetry, BoundedVideoSourceTest::socketLifecycle};
@@ -152,6 +154,47 @@ public final class BoundedVideoSourceTest {
                     reply.expectRejected(); // No redirect may bypass syntax or semantic validation.
                 }
             }
+        }
+    }
+
+    private static void abandonedGatedClients() throws Exception {
+        try (Environment env = new Environment()) {
+            Route video = env.origin.add("abandoned-gate", new Movie(32768, 24, 71));
+            env.source.prefetch(video.url);
+            await(() -> env.source.cachedBytes(video.url) == video.movie.limit, "abandoned-client prefix");
+            String selected = env.source.select(video.url);
+            long offset = video.movie.limit;
+            int before = video.requests.size();
+            // Occupy both serve workers in one selection, then send FIN without any seek,
+            // playback progress or selection change that could otherwise release the gate.
+            try (Reply first = get(selected, "bytes=" + offset + "-" + (offset + 31));
+                 Reply second = get(selected, "bytes=" + (offset + 4096) + "-" + (offset + 4127))) {
+                require(first.status == 206 && second.status == 206, "abandoned ranges were not established");
+                first.expectWaiting();
+                second.expectWaiting();
+                await(() -> env.executor("clients").getActiveCount() == 2, "both gated workers occupied");
+                require(video.requests.size() == before, "held ranges reached origin before playback");
+            }
+            long started = System.nanoTime();
+            try (Reply cached = get(selected, "bytes=0-4095")) {
+                require(cached.status == 206, "third cached range status");
+                equal(cached.read(4096), video.movie.bytes(0, 4096), "third cached range was starved by closed clients");
+            }
+            require(System.nanoTime() - started < TimeUnit.SECONDS.toNanos(2),
+                    "closed gated clients did not promptly release workers");
+            await(() -> env.executor("clients").getActiveCount() == 0, "abandoned and cached workers exit");
+            require(video.requests.size() == before, "closed clients or cache hit fetched origin data");
+
+            // FIN detection must not unlock the video's gate as a side effect.
+            try (Reply gated = get(selected, "bytes=" + offset + "-" + (offset + 31))) {
+                gated.expectWaiting();
+                env.source.position(4999);
+                gated.expectWaiting();
+                require(video.requests.size() == before, "client cleanup disabled the five-second gate");
+                env.source.position(5000);
+                equal(gated.read(32), video.movie.bytes(offset, 32), "normal playback no longer releases gate");
+            }
+            require(video.requests.size() == before + 1, "normal gate release issued duplicate origin requests");
         }
     }
 
